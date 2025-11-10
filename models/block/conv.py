@@ -13,7 +13,7 @@ def auto_padding(
     kernel_size: Union[int, List, Tuple],
     padding: Optional[Union[int, List, Tuple]] = None,
     dilation: int=1
-) -> Union[int, List, Tuple]:
+) -> Union[int, Tuple]:
     """
         自动padding，保持输出同输入大小
         Args:
@@ -30,7 +30,7 @@ def auto_padding(
     if padding is None:
         padding = kernel_size // 2 if isinstance(kernel_size, int) else [x // 2 for x in kernel_size]
     
-    return padding
+    return tuple(padding) if isinstance(padding, list) else padding
 
 
 class Conv(nn.Module):
@@ -44,7 +44,7 @@ class Conv(nn.Module):
         out_channels: int,
         kernel_size: int = 1,
         stride: int = 1,
-        padding: Optional[int] = None,
+        padding: Optional[Union[int, Tuple]] = None,
         groups: int = 1,
         dilation = 1,
         act = True
@@ -59,14 +59,14 @@ class Conv(nn.Module):
             groups（int）：分组
             dilation（int）：卷积核膨胀【空洞】
             act（布尔值 | nn.Module）：激活函数
-        """
+        """
         super().__init__()
         self.conv = nn.Conv2d(
             in_channels = in_channels,
             out_channels = out_channels,
             kernel_size = kernel_size,
             stride = stride,
-            padding = auto_padding(kernel_size=kernel_size, padding=padding, dilation=dilation),
+            padding = 'same' if padding is None else padding, # padding = auto_padding(kernel_size=kernel_size, padding=padding, dilation=dilation),
             groups = groups,
             dilation = dilation,
             bias = False)
@@ -86,8 +86,8 @@ class Conv(nn.Module):
 
 class Bottleneck(nn.Module):
     """
-        标准 bottleneck 模块
-        示意图：../assets/block_illustration/bottleneck.png
+    标准 bottleneck 模块
+    示意图：../assets/block_illustration/bottleneck.png
     """
     def __init__(
         self,
@@ -106,7 +106,7 @@ class Bottleneck(nn.Module):
             groups（int）：分组
             kernel_sizes（Tuple）：两个卷积的卷积核大小
             expansion（float）：膨胀比例
-        """
+        """
         super().__init__()
         _hidden_channels = int(out_channels * expansion)
         self.cv1 = Conv(
@@ -127,14 +127,14 @@ class Bottleneck(nn.Module):
 
 class C2f(nn.Module):
     """
-        包含 2 个卷积层的 CSP Bottleneck 模块
-        示意图：../assets/block_illustration/C2f.png
+    包含 2 个卷积层的 CSP Bottleneck 模块
+    示意图：../assets/block_illustration/C2f.png
     """
     def __init__(
         self,
         in_channels: int,
         out_channels: int,
-        blocks_num: int = 1,
+        num_blocks: int = 1,
         expansion: float = 0.5,
         groups: int = 1,
         shortcut: bool = False
@@ -143,7 +143,7 @@ class C2f(nn.Module):
         Args:
             in_channels (int): 输入通道数
             out_channels (int): 输出通道数
-            blocks_num (int): 块的数量
+            num_blocks (int): 块的数量
             expansion (float): 膨胀比例
             groups (int): 分组
             shortcut (bool): 是否使用参差连接
@@ -151,7 +151,7 @@ class C2f(nn.Module):
         super().__init__()
         self.hidden_channels = int(out_channels * expansion)
         self.cv1 = Conv(in_channels=in_channels, out_channels=2 * self.hidden_channels)
-        self.cv2 = Conv(in_channels=(2 + blocks_num) * self.hidden_channels, out_channels=out_channels)
+        self.cv2 = Conv(in_channels=(2 + num_blocks) * self.hidden_channels, out_channels=out_channels)
         self.module_list = nn.ModuleList(
             Bottleneck(
                 in_channels = self.hidden_channels,
@@ -159,7 +159,7 @@ class C2f(nn.Module):
                 shortcut = shortcut,
                 groups = groups,
                 kernel_sizes = ((3, 3), (3, 3)),
-                expansion = 1.) for _ in range(blocks_num))
+                expansion = 1.) for _ in range(num_blocks))
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = list(self.cv1(x).split(size=(self.hidden_channels, self.hidden_channels), dim=1))
@@ -170,14 +170,14 @@ class C2f(nn.Module):
 
 class C3(nn.Module):
     """
-        包含 3 个卷积层的 CSP Bottleneck 模块
-        示意图：../assets/block_illustration/C3.png
+    包含 3 个卷积层的 CSP Bottleneck 模块
+    示意图：../assets/block_illustration/C3.png
     """
     def __init__(
             self,
             in_channels: int,
             out_channels: int,
-            blocks_num: int = 1,
+            num_blocks: int = 1,
             expansion: float = .5,
             groups: int = 1,
             shortcut: bool = False
@@ -186,7 +186,7 @@ class C3(nn.Module):
         Args:
             in_channels (int): 输入通道数
             out_channels (int): 输出通道数
-            blocks_num (int): 块的数量
+            num_blocks (int): 块的数量
             expansion (float): 膨胀比例
             groups (int): 分组
             shortcut (bool): 是否使用参差连接
@@ -203,7 +203,7 @@ class C3(nn.Module):
                shortcut = shortcut,
                groups = groups,
                kernel_sizes = ((1, 1), (3, 3)),
-               expansion = 1.) for _ in range(blocks_num)))
+               expansion = 1.) for _ in range(num_blocks)))
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.cv3(torch.cat((self.module_list(self.cv1(x)), self.cv2(x)), 1))
@@ -211,14 +211,14 @@ class C3(nn.Module):
 
 class C3k(C3):
     """
-        CSP 瓶颈模块，可定制内核大小
-        示意图：../assets/block_illustration/C3k.png
+    CSP 瓶颈模块，可定制内核大小
+    示意图：../assets/block_illustration/C3k.png
     """
     def __init__(
         self,
         in_channels: int,
         out_channels: int,
-        blocks_num: int = 1,
+        num_blocks: int = 1,
         expansion: float = 0.5,
         groups: int = 1,
         shortcut: bool = True,
@@ -229,13 +229,13 @@ class C3k(C3):
             Args:
             in_channels (int): 输入通道数
             out_channels (int): 输出通道数
-            blocks_num (int): 块的数量
+            num_blocks (int): 块的数量
             expansion (float): 膨胀比例
             groups (int): 分组
             shortcut (bool): 是否使用参差连接
             kernel_size（int）：卷积核大小
         """
-        super().__init__(in_channels, out_channels, blocks_num, expansion, groups, shortcut)
+        super().__init__(in_channels, out_channels, num_blocks, expansion, groups, shortcut)
         _hidden_channels = int(out_channels * expansion)
         self.module_list = nn.Sequential(
             *(Bottleneck(
@@ -244,19 +244,19 @@ class C3k(C3):
                shortcut = shortcut,
                groups = groups,
                kernel_sizes = (kernel_size, kernel_size),
-               expansion = 1.) for _ in range(blocks_num)))
+               expansion = 1.) for _ in range(num_blocks)))
 
 
 class C3k2(C2f):
     """
-        C3k2 模块
-        示意图：../assets/block_illustration/C3k2.png
+    C3k2 模块
+    示意图：../assets/block_illustration/C3k2.png
     """
     def __init__(
         self,
         in_channels: int,
         out_channels: int,
-        blocks_num: int = 1,
+        num_blocks: int = 1,
         c3k: bool = False,
         expansion: float = 0.5,
         groups: int = 1,
@@ -266,19 +266,19 @@ class C3k2(C2f):
         Args:
             in_channels (int): 输入通道数
             out_channels (int): 输出通道数
-            blocks_num (int): 块的数量
+            num_blocks (int): 块的数量
             c3k (bool): 是否使用 C3k 块
             expansion (float): 膨胀比例
             groups (int): 分组
             shortcut (bool): 是否使用参差连接
         """
-        super().__init__(in_channels, out_channels, blocks_num, expansion, groups, shortcut)
+        super().__init__(in_channels, out_channels, num_blocks, expansion, groups, shortcut)
         if c3k:
             self.module_list = nn.ModuleList(
                 C3k(
                     in_channels = self.hidden_channels,
                     out_channels = self.hidden_channels,
-                    blocks_num = 2,
+                    num_blocks = 2,
                     shortcut = shortcut,
                     groups = groups))
         else:
@@ -287,15 +287,107 @@ class C3k2(C2f):
                     in_channels = self.hidden_channels,
                     out_channels = self.hidden_channels,
                     shortcut = shortcut,
-                    groups = groups) for _ in range(blocks_num))
+                    groups = groups) for _ in range(num_blocks))
+
+
+class SPP(nn.Module):
+    """Spatial Pyramid Pooling (SPP) layer https://arxiv.org/abs/1406.4729."""
+
+    def __init__(self, c1: int, c2: int, k: tuple[int, ...] = (5, 9, 13)):
+        """Initialize the SPP layer with input/output channels and pooling kernel sizes.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int): Output channels.
+            k (tuple): Kernel sizes for max pooling.
+        """
+        super().__init__()
+        c_ = c1 // 2
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c_ * (len(k) + 1), c2, 1, 1)
+        self.m = nn.ModuleList([nn.MaxPool2d(kernel_size=x, stride=1, padding=x // 2) for x in k])
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass of the SPP layer, performing spatial pyramid pooling."""
+        x = self.cv1(x)
+        return self.cv2(torch.cat([x] + [m(x) for m in self.m], 1))
+
+
+class SPPF(nn.Module):
+    """
+    空间金字塔池化-Fast
+    示意图：../assets/block_illustration/SPPF.png
+    """
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 5):
+        """等价于 SPP(k=(5, 9, 13))
+        Args:
+            in_channels (int): 输入维度.
+            out_channels (int): 输出维度
+            kernel_size (int): 核大小
+        """
+        super().__init__()
+        _hidden_channels = in_channels // 2
+        self.cv1 = Conv(in_channels=in_channels, out_channels=_hidden_channels)
+        self.cv2 = Conv(in_channels=_hidden_channels * 4, out_channels=out_channels, 1, 1)
+        self.m = nn.MaxPool2d(kernel_size=kernel_size, stride=1, padding=k // 2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply sequential pooling operations to input and return concatenated feature maps."""
+        y = [self.cv1(x)]
+        y.extend(self.m(y[-1]) for _ in range(3))
+        return self.cv2(torch.cat(y, 1))
+
+
+class Attention(nn.Module):
+    """
+    自注意力模块
+    示意图：../assets/block_illustration/Attention.png
+    """
+    def __init__(self, dim: int, num_heads: int = 8, attn_ratio: float = 0.5):
+        """
+            dim (int): 特征维度
+            num_heads (int): 注意力头
+            attn_ratio (float): 关键维度的关注度比率
+        """
+        super().__init__()
+        self.num_heads = num_heads
+        assert dim % num_heads == 0, "dim 必须被 num_heads 整除"
+        self.head_dim = dim // num_heads
+        self.key_dim = int(self.head_dim * attn_ratio)
+        self.scale = self.key_dim**-0.5
+        nh_kd = self.key_dim * num_heads
+        h = dim + nh_kd * 2
+        self.qkv = Conv(in_channels=dim, out_channels=h, kernel_size=1, act=False)
+        self.proj = Conv(in_channels=dim, out_channels=dim, kernel_size=1, act=False)
+        self.pe = Conv(in_channels=dim, out_channels=dim, kernel_size=3, groups=dim, act=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape
+        N = H * W
+        qkv = self.qkv(x)
+        q, k, v = qkv.view(B, self.num_heads, self.key_dim * 2 + self.head_dim, N).split(
+            [self.key_dim, self.key_dim, self.head_dim], dim=2)
+
+        attn = (q.transpose(-2, -1) @ k) * self.scale
+        attn = attn.softmax(dim=-1)
+        x = (v @ attn.transpose(-2, -1)).view(B, C, H, W) + self.pe(v.reshape(B, C, H, W))
+        x = self.proj(x)
+
+        return x
 
 
 class PSABlock(nn.Module):
     """
-        位置敏感注意力模块，封装了应用多头注意力和前馈神经网络层的功能
-        示意图：../assets/block_illustration/PSABlock.png
-    """
-    def __init__(self, channels: int, attn_ratio: float = 0.5, num_heads: int = 4, shortcut: bool = True) -> None:
+    位置敏感注意力模块，封装了应用多头注意力和前馈神经网络层的功能
+    示意图：../assets/block_illustration/PSABlock.png
+    """
+    def __init__(
+        self,
+        channels: int,
+        attn_ratio: float = 0.5,
+        num_heads: int = 4,
+        shortcut: bool = True
+    ):
         """
         Args:
             channels（int）：输入和输出通道数
@@ -319,15 +411,21 @@ class PSABlock(nn.Module):
 
 class C2PSA(nn.Module):
     """
-        具有注意力机制的C2PSA模块，与 PSA 模块相同，但允许堆叠更多 PSABlock 模块
-        示意图：../assets/block_illustration/C2PSA.png
-    """
-    def __init__(self, in_channels: int, out_channels: int, blocks_num: int = 1, expansion: float = 0.5):
+    具有注意力机制的C2PSA模块，与 PSA 模块相同，但允许堆叠更多 PSABlock 模块
+    示意图：../assets/block_illustration/C2PSA.png
+    """
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        num_blocks: int = 1,
+        expansion: float = 0.5
+    ):
         """
         Args:
             in_channels (int): 输入通道数
             out_channels (int): 输出通道数
-            blocks_num (int): 块的数量
+            num_blocks (int): 块的数量
             expansion (float): 膨胀比例
         """
         super().__init__()
@@ -339,10 +437,10 @@ class C2PSA(nn.Module):
             *(PSABlock(
                 self.hidden_channels,
                 attn_ratio = 0.5,
-                num_heads = self.hidden_channels // 64) for _ in range(blocks_num)))
+                num_heads = self.hidden_channels // 64) for _ in range(num_blocks)))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = list(self.cv1(x).split((self.hidden_channels, self.hidden_channels), dim=1))
-        y[1] = self.module_list(y)
+        y[0] = self.module_list(y[0])
 
         return self.cv2(torch.cat(y, 1))
