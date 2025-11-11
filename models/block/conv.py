@@ -66,11 +66,11 @@ class Conv(nn.Module):
             out_channels = out_channels,
             kernel_size = kernel_size,
             stride = stride,
-            padding = 'same' if padding is None else padding, # padding = auto_padding(kernel_size=kernel_size, padding=padding, dilation=dilation),
+            padding = auto_padding(kernel_size=kernel_size, padding=padding, dilation=dilation),
             groups = groups,
             dilation = dilation,
             bias = False)
-        self.bn = nn.BatchNorm2d(num_features = out_channels)
+        self.bn = nn.BatchNorm2d(num_features=out_channels, eps=1e-2, momentum=.03)
         self.act = nn.Identity()
         if act:
             self.act = act if isinstance(act, nn.Module) else self.default_act
@@ -280,7 +280,7 @@ class C3k2(C2f):
                     out_channels = self.hidden_channels,
                     num_blocks = 2,
                     shortcut = shortcut,
-                    groups = groups))
+                    groups = groups) for _ in range(num_blocks))
         else:
             self.module_list = nn.ModuleList(
                 Bottleneck(

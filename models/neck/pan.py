@@ -10,102 +10,64 @@ from blocks import Conv, C3k2
 class C3k2PAN(nn.Module):
     def __init__(
         self,
-        in_channels: Union[List[int], Tuple[int, int, int]] = (128, 256, 512),
-        out_channels: Optional[Union[List[int], Tuple[int, int, int]]] = None,
-        c3_blocks: int = 1,
-        c3k: bool = False,  # 我们在这里使用 C3k2(c3k=False) 作为默认的 C3k2_F_1
+        in_channels: Union[List[int], Tuple[int, int, int]] = (256, 256, 512),
+        out_channels: Optional[Union[List[int], Tuple[int, int, int]]] = (256, 256, 512),
+        p_channels: List[int] = [512, 256, 128],
+        c3_blocks: int = 1
     ):
         super().__init__()
-        assert len(in_channels) == 3, "输入必须是三层特征图 (c3, c4, c5)"
-        self.c3_ch, self.c4_ch, self.c5_ch = in_channels
-
-        if out_channels is None: # 默认保持与输入通道一致
-            self.out_ch3, self.out_ch4, self.out_ch5 = self.c3_ch, self.c4_ch, self.c5_ch
-        else:
-            assert len(out_channels) == 3
-            self.out_ch3, self.out_ch4, self.out_ch5 = out_channels
-
-        # ----- Top-down (FPN) part -----
-        # 1x1 conv to reduce c5 -> c4 (使上采样后能 concat)
-        self.reduce_conv5 = Conv(in_channels=self.c5_ch, out_channels=self.c4_ch, kernel_size=1, stride=1)
-        # C3k2 module after concat (c4 + reduced_c5 -> 2*c4 in -> out c4)
-        self.c3f_fusion_4 = C3k2(in_channels=2 * self.c4_ch, out_channels=self.c4_ch,
-                                 num_blocks=c3_blocks, c3k=c3k)
-
-        # reduce to c3 for next upsample stage
-        self.reduce_conv4 = Conv(in_channels=self.c4_ch, out_channels=self.c3_ch, kernel_size=1, stride=1)
-        self.c3f_fusion_3 = C3k2(in_channels=2 * self.c3_ch, out_channels=self.c3_ch,
-                                 num_blocks=c3_blocks, c3k=c3k)
-
-        # ----- Bottom-up (PAN) part -----
-        # downsample convs (stride=2) to go from c3 -> c4 and c4 -> c5
-        self.downsample_conv3 = Conv(in_channels=self.c3_ch, out_channels=self.c3_ch, kernel_size=3, stride=2, padding=1)
-        # after concat with original mid-level (c4), process with C3k2 -> out c4
-        self.c3f_pan_4 = C3k2(in_channels=self.c4_ch + self.c3_ch, out_channels=self.c4_ch,
-                              num_blocks=c3_blocks, c3k=c3k)
-
-        self.downsample_conv4 = Conv(in_channels=self.c4_ch, out_channels=self.c4_ch, kernel_size=3, stride=2, padding=1)
-        self.c3f_pan_5 = C3k2(in_channels=self.c5_ch + self.c4_ch, out_channels=self.c5_ch,
-                              num_blocks=c3_blocks, c3k=c3k)
-
-        # 最终可能希望调整输出通道，使之等于 out_ch*
-        # 如果希望最后输出通道和 out_channels 指定的不一致，可以再跟 1x1 conv 对齐
-        self.out_conv3 = None
-        self.out_conv4 = None
-        self.out_conv5 = None
-        if self.out_ch3 != self.c3_ch:
-            self.out_conv3 = Conv(in_channels=self.c3_ch, out_channels=self.out_ch3, kernel_size=1, stride=1)
-        if self.out_ch4 != self.c4_ch:
-            self.out_conv4 = Conv(in_channels=self.c4_ch, out_channels=self.out_ch4, kernel_size=1, stride=1)
-        if self.out_ch5 != self.c5_ch:
-            self.out_conv5 = Conv(in_channels=self.c5_ch, out_channels=self.out_ch5, kernel_size=1, stride=1)
+        assert len(in_channels) == 3, "输入必须是三层特征图 (x3, x4, x5)"
+        self.c3_channels, self.c4_channels, self.c5_channels = in_channels
+        assert len(out_channels) == 3, "输出必须是三层特征图 (n3, n4, n5)"
+        self.out3_channels, self.out4_channels, self.out5_channels = out_channels
+        self.top2down_c3k2_f_4p4 = C3k2(
+            in_channels = self.c5_channels + self.c4_channels,
+            out_channels = p_channels[1],
+            num_blocks = c3_blocks,
+            c3k = False)
+        self.top2down_c3k2_f_4p3 = C3k2(
+            in_channels = self.c4_channels + p_channels[1],
+            out_channels = p_channels[2],
+            num_blocks = c3_blocks,
+            c3k = False)
+        self.bottom2up_downsample_conv_4p3 = Conv(
+            in_channels = p_channels[2],
+            out_channels = p_channels[2],
+            kernel_size = 3,
+            stride = 2,
+            padding = 1)
+        self.bottom2up_c3k2_f_4n4 = C3k2(
+            in_channels = p_channels[1] + p_channels[2],
+            out_channels = self.out4_channels,
+            num_blocks = c3_blocks,
+            c3k = False)
+        self.bottom2up_downsample_conv_4n4 = Conv(
+            in_channels = self.out4_channels,
+            out_channels = self.out4_channels,
+            kernel_size = 3,
+            stride = 2,
+            padding = 1)
+        self.bottom2up_c3k2_t_4n5 = C3k2(
+            in_channels = self.c5_channels + self.out4_channels,
+            out_channels = self.out5_channels,
+            num_blocks = c3_blocks,
+            c3k = True)
 
     def forward(self, features):
-        """
-        features: list/tuple of three tensors [x3, x4, x5] where
-            x3: largest spatial (e.g. 80x80) channels = c3_ch
-            x4: medium (e.g. 40x40) channels = c4_ch
-            x5: smallest (e.g. 20x20) channels = c5_ch
-        returns: (p3_out, p4_out, p5_out)
-        """
+        """features: (x3: 80x80, x4: 40x40, x5: 20x20) Middle: (p3, p4, p5) Returns: (n3, n4, n5)"""
         assert len(features) == 3
-        x3, x4, x5 = features  # x3: 80x80, x4: 40x40, x5: 20x20
-
+        x3, x4, x5 = features
         # ---- top-down ----
-        # reduce c5 -> c4 channels, upsample, concat with x4
-        p5_reduced = self.reduce_conv5(x5)  # -> channels c4_ch
-        p5_upsampled = F.interpolate(p5_reduced, size=x4.shape[-2:], mode='nearest')
-        # concat along channel
-        p4_cat = torch.cat([p5_upsampled, x4], dim=1)  # channels 2*c4
-        p4_fused = self.c3f_fusion_4(p4_cat)  # out channels = c4_ch
-
-        # further reduce & upsample to merge with x3
-        p4_reduced = self.reduce_conv4(p4_fused)  # -> channels c3_ch
-        p4_upsampled = F.interpolate(p4_reduced, size=x3.shape[-2:], mode='nearest')
-        p3_cat = torch.cat([p4_upsampled, x3], dim=1)  # channels 2*c3
-        p3_fused = self.c3f_fusion_3(p3_cat)  # out channels = c3_ch
-
+        p5 = x5
+        p5_upsampled = F.interpolate(x5, size=x4.shape[-2:], mode='nearest')
+        p4 = self.top2down_c3k2_f_4p4(torch.cat([p5_upsampled, x4], dim=1))
+        p4_upsampled = F.interpolate(p4, size=x3.shape[-2:], mode='nearest')
+        p3 = self.top2down_c3k2_f_4p3(torch.cat([p4_upsampled, x3], dim=1))
         # ---- bottom-up ----
-        # downsample p3_fused and concat with p4_fused (note channels: p3_down=c3_ch, p4_fused=c4_ch)
-        p3_down = self.downsample_conv3(p3_fused)  # spatial 80->40, channels c3_ch
-        p4_cat_pan = torch.cat([p3_down, p4_fused], dim=1)  # channels c3_ch + c4_ch
-        p4_out = self.c3f_pan_4(p4_cat_pan)  # out -> c4_ch
+        n3 = p3
+        p3_down = self.bottom2up_downsample_conv_4p3(p3)
+        n4 = self.bottom2up_c3k2_f_4n4(torch.cat([p3_down, p4], dim=1))
+        n4_down = self.bottom2up_downsample_conv_4n4(n4)
+        n5 = self.bottom2up_c3k2_t_4n5(torch.cat([n4_down, p5], dim=1))
 
-        # downsample p4_out and concat with original p5 (or p5_reduced?)
-        p4_down = self.downsample_conv4(p4_out)  # 40->20
-        # concat with original backbone x5 (or with p5_reduced). 为保证语义完整，通常 concat 原始 x5（c5_ch）
-        p5_cat_pan = torch.cat([p4_down, x5], dim=1)  # channels c4_ch + c5_ch
-        p5_out = self.c3f_pan_5(p5_cat_pan)  # out -> c5_ch
-
-        # 对齐输出通道（可选）
-        if self.out_conv3 is not None:
-            p3_out = self.out_conv3(p3_fused)
-        else:
-            p3_out = p3_fused
-        if self.out_conv4 is not None:
-            p4_out = self.out_conv4(p4_out)
-        # else p4_out already set
-        if self.out_conv5 is not None:
-            p5_out = self.out_conv5(p5_out)
-
-        return p3_out, p4_out, p5_out
+        return n3, n4, n5
