@@ -19,8 +19,8 @@ class DualBranchHead(nn.Module):
         in_channels: int,
         categories: int,
         box_channels: int,
-        locate_hidden_channels: Optional[int] = None,
-        classify_hidden_channels: Optional[int] = None,
+        locate_hidden_channels: int,
+        classify_hidden_channels: int,
     ):
         super().__init__()
         self.locate = nn.Sequential(
@@ -98,7 +98,7 @@ class YOLODetector(nn.Module):
     def forward(
         self,
         features: Union[Tuple[torch.Tensor, torch.Tensor, torch.Tensor], List[torch.Tensor]],
-    ) -> List[torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         assert isinstance(features, (list, tuple)) and len(features) == 3, \
             "features must be a list/tuple of 3 tensors"
         outs = tuple()

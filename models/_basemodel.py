@@ -43,8 +43,7 @@ class BaseModel(nn.Module):
             return module_or_class(**cfg)
         else:
             raise TypeError(
-                f"{name} 必须是 nn.Module 实例 或 nn.Module 子类，当前类型为 {type(module_or_class)}"
-            )
+                f"{name} 必须是 nn.Module 实例 或 nn.Module 子类，当前类型为 {type(module_or_class)}")
 
     def forward_backbone(self, x: torch.Tensor) -> Any:
         return self.backbone(x)
@@ -62,15 +61,15 @@ class BaseModel(nn.Module):
         out = self.forward_head(fused)
         if self.custom_postprocess is not None:
             out = self.custom_postprocess(out)
-        return out
+
+        return feats, fused, out
 
     def summary(self) -> Dict[str, str]:
         return {
             "backbone": self.backbone.__class__.__name__,
             "neck": self.neck.__class__.__name__,
             "head": self.head.__class__.__name__,
-            "has_custom_postprocess": str(self.custom_postprocess is not None),
-        }
+            "has_custom_postprocess": str(self.custom_postprocess is not None)}
 
     def set_postprocess(self, fn: Callable[[Any], Any]):
         self.custom_postprocess = fn

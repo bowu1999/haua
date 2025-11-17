@@ -21,6 +21,7 @@ def auto_padding(
             kernel_sizes = tuple(kernel_size)
         computed = tuple((((k - 1) * dilation + 1) // 2) for k in kernel_sizes)
         return computed[0] if len(computed) == 1 else computed
+
     return padding
 
 
