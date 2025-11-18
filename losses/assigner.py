@@ -204,28 +204,24 @@ def tal_assign(
     topk: int = 10,
     cls_power: float = 1.0,
     iou_power: float = 2.0,
-    use_pairwise_for_candidates: bool = False
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Task-Aligned Label Assignment (TAL) for YOLO-style detectors — batch version.
+    检测器的任务批处理对齐标签分配 (TAL)
 
     Args:
-        pred_scores: (B, N, C) predicted class logits or pre-sigmoid scores.
-                     It's okay to pass logits; we will apply sigmoid when computing cls prob.
-        pred_bboxes: (B, N, 4) predicted boxes in xyxy (same coord system as gt_bboxes).
-        gt_bboxes:   (B, G, 4) ground-truth boxes (xyxy).
-        gt_labels:   (B, G) ground-truth class indices (long).
-        topk:        how many anchors (per GT) to select as candidates by align metric.
-        cls_power:   exponent applied to classification score in align metric (default 1.0).
-        iou_power:   exponent applied to IoU in align metric (default 2.0, matches TAL paper practice).
-        use_pairwise_for_candidates: if True, use pairwise_iou (your other function) on candidate subsets
-                                     to re-check IoUs (optional, for debugging / alternative pipelines).
+        pred_scores: (B, N, C) 预测类别logits或sigmoid前得分
+        pred_bboxes: (B, N, 4) 预测框位于 xyxy 坐标系中（与 gt_ 框的坐标系相同）
+        gt_bboxes:   (B, G, 4) 真实框（xyxy）
+        gt_labels:   (B, G) 真实类别索引（long）
+        topk:        根据对齐指标，每个 GT 选择候选锚点的数量
+        cls_power:   应用于对齐度量中分类得分的指数（默认值为 1.0）
+        iou_power:   应用于 align 指标中的 IoU 的指数（默认值为 2.0，与 TAL 论文实践相符）
 
     Returns:
-        target_scores: (B, N, C) soft one-hot target scores (0 or weighted by align score)
-        target_bboxes: (B, N, 4) assigned GT bbox for positive anchors (zeros for negatives)
-        fg_mask:       (B, N) boolean mask indicating positive samples
-        matched_gt_inds:(B, N) long tensor, -1 means background, otherwise index of assigned GT in 0..G-1
+        target_scores: (B, N, C) 软独热目标分数（0 或按对齐分数加权）
+        target_bboxes: (B, N, 4) 为正样本锚点分配 GT bbox（为负样本锚点分配零）
+        fg_mask:       (B, N) 布尔掩码指示正样本
+        matched_gt_inds:(B, N) long tensor，-1 表示背景，否则表示分配的 GT 在 0..G-1 范围内的索引
 
     Notes:
         - This implementation follows the typical TAL flow:
@@ -263,68 +259,56 @@ def tal_assign(
         # 2) classification score per (N, G): take predicted probability for each GT label
         #    apply sigmoid to logits to get probability in [0,1]
         prob = ps.sigmoid()        # (N, C)
-        # build (G, C) one-hot for gt labels so prob @ one_hot.T -> (N,G) selecting label prob
+        # 构建 (G, C) 独热编码，用于 gt 标签，因此概率 @ one_hot.T -> (N,G) 选择标签概率
         gt_one_hot = F.one_hot(gt_l.long(), num_classes=C).float()  # (G, C)
         cls_score = prob @ gt_one_hot.T                            # (N, G)
 
-        # 3) align metric
+        # 3) 度量矩阵
         align_metric = (cls_score.clamp(min=1e-8) ** cls_power) * (ious.clamp(min=1e-8) ** iou_power)  # (N, G)
 
-        # 4) for each GT select top-k anchors by align_metric (we want the best N_k anchors per GT)
+        # 4) 对于每个 GT，根据 align_metric 选择前 k 个锚框
         k = min(topk, N)
         # topk over dim=0 gives topk anchors for each GT -> returns (k, G) values/indices
         topk_vals, topk_idx = align_metric.topk(k=k, dim=0, largest=True)  # topk_idx: (k, G)
-        # Build boolean mask (N, G) marking candidate anchors for each GT
+        # 构建 bool 掩码 (N, G)，标记每个 GT 的候选锚框。
         candidate_mask = torch.zeros_like(align_metric, dtype=torch.bool)  # (N,G)
+        # [None, :] 是增加维度操作，将原本的 1D 张量 (K,) 变成 2D 张量 (1, K)，方便与 topk_idx 的形状 (N, K) 广播匹配。
         candidate_mask[topk_idx, torch.arange(topk_idx.size(1), device=device)[None, :]] = True
-
-        # Optional: re-check IoUs on the chosen candidate subset using pairwise_iou
-        # (this is optional and often unnecessary; provided for illustration/testing)
-        if use_pairwise_for_candidates:
-            # gather candidate pb boxes per GT (this is a bit more involved: we compute per GT)
-            # For efficiency in real code you may vectorize; here clarity is prioritized.
-            for g in range(gt_b.size(0)):
-                cand_idx = candidate_mask[:, g].nonzero(as_tuple=False).squeeze(1)
-                if cand_idx.numel() == 0:
-                    continue
-                # compute pairwise IoU between those candidate preds and this gt (1 box) via pairwise_iou
-                # pairwise_iou expects (N_sub, 4) and (1,4) => returns (N_sub,1)
-                # This is a debugging/verification step and doesn't change candidate selection here.
-                _ = pairwise_iou(pb[cand_idx], gt_b[g:g+1])
 
         # 5) determine final positive anchors:
         # anchors that are candidate for any GT are positives (but may conflict)
+        # 主要用来标记正样本，即与任何 GT 有重叠的锚点
         pos_mask_any = candidate_mask.any(dim=1)  # (N,)
         fg_mask[b] = pos_mask_any
 
         if pos_mask_any.sum() == 0:
             continue
 
-        # Resolve conflicts: for each anchor choose GT with maximum align_metric (or IoU tie-break)
-        # we set align_metric for non-candidate positions to -inf so argmax picks only among candidates.
+        # 解决冲突：对于每个锚点，选择 align_metric 值最大的 GT
+        # 将非候选位置的 align_metric 值设置为 -inf，以便 argmax 仅在候选位置中选择
         am = align_metric.clone()
         am[~candidate_mask] = -1e9  # ignore non-candidates
         # matched_gt for each anchor: argmax over G -> value in [0,G-1]
         matched = am.argmax(dim=1)  # (N,)
         matched_scores = am.max(dim=1)[0]  # chosen align metric per anchor
 
-        # anchors that were not candidates will have matched_scores = -1e9; we must mask them out
-        valid_pos = matched_scores > -1e8
+        # 那些并非候选锚点的匹配分数将为 -1e9；我们必须将它们屏蔽掉。
+        valid_pos = matched_scores > -1e9
 
         # set outputs for valid positives
         pos_idxs = valid_pos.nonzero(as_tuple=False).squeeze(1)
         if pos_idxs.numel() > 0:
-            # fill matched gt indices
+            # 填充匹配的 gt 索引
             matched_gt_inds[b, pos_idxs] = matched[pos_idxs].long()
-            # assign bboxes and class targets
-            assigned_gt_idx = matched[pos_idxs].long()  # indices into GT
+            # 分配边界框和类别目标
+            assigned_gt_idx = matched[pos_idxs].long()  # GT 下标
             target_bboxes[b, pos_idxs] = gt_b[assigned_gt_idx]  # (P,4)
-            # one-hot class assignment (hard one-hot weighted by align metric)
-            # build one-hot and multiply by align-score as a soft target (can be used with BCE loss)
+            # 独热编码分类（硬独热编码，按对齐指标加权）
+            # 构建独热编码并乘以对齐分数作为软目标（可与 BCE 损失一起使用）
             assigned_labels = gt_l[assigned_gt_idx]  # (P,)
-            # set one-hot to 1.0 at assigned label
+            # 将指定标签的独热码设置为 1.0
             target_scores[b, pos_idxs, assigned_labels] = 1.0
-            # weight per anchor (normalize weights per anchor optional)
+            # 每个锚点的权重（可选择对每个锚点的重量进行标准化）
             weights = matched_scores[pos_idxs].clamp(min=0)
             # Normalize weights to [0,1] by dividing by max (avoid division by zero)
             if weights.numel() > 0:

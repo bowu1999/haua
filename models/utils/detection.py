@@ -1,12 +1,14 @@
+from typing import Tuple, Optional
+
 import torch
 import torch.nn.functional as F
 
 
-def make_grid(h: int, w: int, stride: int = 1, device=None, dtype=torch.float32):
+def make_grid(hw: Tuple[int, int], stride: int = 1, device=None, dtype=torch.float32):
     """
     创建 feature map 的格点中心坐标 grid
     Args:
-        h, w (int):
+        hw (Tuple[int, int]):
             特征图的高度与宽度
 
         stride (int):
@@ -19,13 +21,13 @@ def make_grid(h: int, w: int, stride: int = 1, device=None, dtype=torch.float32)
         grid (Tensor):
             形状 (H, W, 2) 的网格，每个位置为 (cx, cy)
     """
+    h, w = hw
     ys = (torch.arange(h, device=device, dtype=dtype) + 0.5) * stride
     xs = (torch.arange(w, device=device, dtype=dtype) + 0.5) * stride
     grid_y, grid_x = torch.meshgrid(ys, xs, indexing='ij')
     grid = torch.stack((grid_x, grid_y), dim=-1)
 
     return grid
-
 
 
 def make_anchors(feats, strides, grid_cell_offset=0.5):
@@ -99,42 +101,74 @@ def decode_dfl(
     pred_reg: torch.Tensor,
     reg_max: int = 16,
     stride: int = 1,
+    grid: Optional[torch.Tensor] = None,
     apply_softmax: bool = True
 ):
     """
-    YOLOv8/YOLO10/YOLO11 风格的 DFL 边界框解码函数
+    通用强化版 DFL 解码函数，兼容 YOLOv5/8/10/11 风格，以及任意输入 shape：
+        - (B, 4*reg_max, H, W)
+        - (B, 4, reg_max, H, W)
+
     Args:
-        pred_reg (Tensor):边界框回归预测，形状可为：
-            - (B, 4*reg_max, H, W)
-            - (B, 4, reg_max, H, W)
-        reg_max (int):DFL bins 数（每条边的离散概率长度）
-        stride (int):当前特征图的 stride，用于将 bins 距离转换为像素单位
-        apply_softmax (bool):是否对 logits 应用 softmax。一般为 True
+        pred_reg (Tensor): 模型输出的回归预测。
+        reg_max (int): DFL bins 数量。
+        stride (int): 当前尺度的 stride。
+        grid (Tensor | None): 锚点坐标，可为 (H,W,2) 或 (N,2)，若为 None 会自动生成。
+        apply_softmax (bool): 是否对 bins 维度做 softmax。
 
     Returns:
-        boxes (Tensor): 解码后的边界框位置，形状 (B, H*W, 4)，格式为 (x1, y1, x2, y2)
-        dist_pixels (Tensor): 每个位置的像素级别的偏移量 (l, t, r, b)，形状为 (B,4,H,W)
-            可用于 loss 分支等其他用途。
+        boxes (Tensor): (B, H*W, 4) xyxy
+        dist_pixels (Tensor): (B,4,H,W)
     """
-    if pred_reg.dim() == 4:
-        _, C, H, W = pred_reg.shape
+    device = pred_reg.device
+    dtype = pred_reg.dtype
+    # 1. 标准化 pred_reg shape → (B, N, 4, reg_max)
+    if pred_reg.dim() == 4: # (B, 4*reg_max, H, W)
+        B, C, H, W = pred_reg.shape
+        assert C == 4 * reg_max, f"通道数不匹配: {C} vs {4*reg_max}"
+        pred = pred_reg.view(B, 4, reg_max, H, W).permute(0, 3, 4, 1, 2)
+        pred = pred.reshape(B, H * W, 4, reg_max)
+    else: # (B, 4, reg_max, H, W)
+        B, _, _, H, W = pred_reg.shape
+        pred = pred_reg.permute(0, 3, 4, 1, 2).reshape(B, H * W, 4, reg_max)
+    N = H * W
+    # 2. softmax 得到 bins 概率分布
+    if apply_softmax:
+        prob = F.softmax(pred, dim=-1)  # (B, N, 4, bins)
     else:
-        _, _, _, H, W = pred_reg.shape
-    dist_bins = dfl2dist(pred_reg, reg_max=reg_max, apply_softmax=apply_softmax)  # (B,4,H,W)
-    dist_pixels = dist_bins * float(stride)
-    grid = make_grid(H, W, stride=stride, device=pred_reg.device, dtype=dist_pixels.dtype)  # (H,W,2)
-    cx = grid[..., 0].unsqueeze(0).unsqueeze(1)  # (1,1,H,W)
-    cy = grid[..., 1].unsqueeze(0).unsqueeze(1)  # (1,1,H,W)
-    l = dist_pixels[:, 0:1, :, :]
-    t = dist_pixels[:, 1:2, :, :]
-    r = dist_pixels[:, 2:3, :, :]
-    b = dist_pixels[:, 3:4, :, :]
+        prob = pred
+    # 期望值法 → (B, N, 4)
+    idx = torch.arange(reg_max, device=device, dtype=dtype)
+    exp = (prob * idx).sum(dim=-1)
+    # 转换为像素偏移
+    dist = exp * float(stride)  # (B, N, 4)
+    # 3. 生成 grid (N,2)
+    if grid is None:
+        grid_y, grid_x = torch.meshgrid(
+            torch.arange(H, device=device),
+            torch.arange(W, device=device),
+            indexing="ij")
+        # 中心点坐标 = (x+0.5, y+0.5) * stride
+        grid = torch.stack([(grid_x + 0.5) * stride, (grid_y + 0.5) * stride], dim=-1)
+        grid = grid.reshape(N, 2).to(dtype)
+    else: # grid 支持 (H,W,2) or (N,2) 
+        if grid.dim() == 3:
+            grid = grid.reshape(N, 2)
+        grid = grid.to(device=device, dtype=dtype)
+    # 4. 计算 x1y1x2y2
+    cx = grid[:, 0][None].expand(B, N)
+    cy = grid[:, 1][None].expand(B, N)
+    l = dist[..., 0]
+    t = dist[..., 1]
+    r = dist[..., 2]
+    b = dist[..., 3]
     x1 = cx - l
     y1 = cy - t
     x2 = cx + r
     y2 = cy + b
-    boxes = torch.cat([x1, y1, x2, y2], dim=1)  # (B,4,H,W)
-    boxes = boxes.permute(0, 2, 3, 1).reshape(pred_reg.shape[0], H * W, 4)
+    boxes = torch.stack([x1, y1, x2, y2], dim=-1)  # (B,N,4)
+    # 5. 同时输出 dist_pixels: (B,4,H,W)
+    dist_pixels = dist.reshape(B, H, W, 4).permute(0, 3, 1, 2)
 
     return boxes, dist_pixels
 
@@ -368,3 +402,10 @@ def centers_of_boxes(boxes: torch.Tensor) -> torch.Tensor:
     cy = (boxes[:,1] + boxes[:,3]) * 0.5
 
     return torch.stack([cx, cy], dim=1)
+
+def bbox_area(boxes: torch.Tensor) -> torch.Tensor:
+    """
+    boxes: (N,4) x1,y1,x2,y2
+    returns: (N,) area of each box
+    """
+    return (boxes[:, 2] - boxes[:, 0]).clamp(min=0) * (boxes[:, 3] - boxes[:, 1]).clamp(min=0)

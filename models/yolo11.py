@@ -104,7 +104,7 @@ class Yolo11_train(nn.Module):
         self.aux_head.train()
     
     def forward(self, x):
-        _, _, one2one = self.yolo11(x)
-        one2many = self.aux_head(x)
+        _, fused, one2one = self.yolo11(x)
+        one2many = self.aux_head(fused)
 
         return {"one2many": one2many, "one2one": one2one}
