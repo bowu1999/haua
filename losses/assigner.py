@@ -203,119 +203,259 @@ def tal_assign(
     gt_labels: torch.Tensor,
     topk: int = 10,
     cls_power: float = 1.0,
-    iou_power: float = 2.0,
+    iou_power: float = 3.0,
+    use_center_constraint: bool = True,
+    center_radius: float = 0.5,
+    use_softmax: bool = False,
+    min_iou_for_candidate: float = 1e-6,
+    debug: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    检测器的任务批处理对齐标签分配 (TAL)
-
-    Args:
-        pred_scores: (B, N, C) 预测类别logits或sigmoid前得分
-        pred_bboxes: (B, N, 4) 预测框位于 xyxy 坐标系中（与 gt_ 框的坐标系相同）
-        gt_bboxes:   (B, G, 4) 真实框（xyxy）
-        gt_labels:   (B, G) 真实类别索引（long）
-        topk:        根据对齐指标，每个 GT 选择候选锚点的数量
-        cls_power:   应用于对齐度量中分类得分的指数（默认值为 1.0）
-        iou_power:   应用于 align 指标中的 IoU 的指数（默认值为 2.0，与 TAL 论文实践相符）
-
-    Returns:
-        target_scores: (B, N, C) 软独热目标分数（0 或按对齐分数加权）
-        target_bboxes: (B, N, 4) 为正样本锚点分配 GT bbox（为负样本锚点分配零）
-        fg_mask:       (B, N) 布尔掩码指示正样本
-        matched_gt_inds:(B, N) long tensor，-1 表示背景，否则表示分配的 GT 在 0..G-1 范围内的索引
-
-    Notes:
-        - This implementation follows the typical TAL flow:
-            1. compute IoU(pred_bbox, gt_bbox) -> (N, G)
-            2. compute cls_score (N, G) by picking predicted prob for each gt label
-            3. align_metric = (cls_score ** cls_power) * (iou ** iou_power)
-            4. for each GT, select top-k anchors by align_metric (these are candidates)
-            5. anchors that are selected by any GT become positives (if conflict, we choose the GT
-               that gives maximum align_metric / IoU)
-        - We return targets suitable to be plugged into your loss computation.
+    更稳健的 Task-Aligned Assigner 实现（兼容 logits 或 probs 输入，带数值保护）
+    返回:
+        target_scores: (B, N, C)  — only assigned class positions non-zero (scaled by weight)
+        target_bboxes: (B, N, 4)
+        fg_mask: (B, N) bool
+        matched_gt_inds: (B, N) long, -1 表示背景 (index into original gt list for that image)
+    重要改动与策略：
+      - 候选选取后会删除 IoU 极低的匹配（min_iou_for_pos，默认为至少 0.12，除非用户传了更大）
+      - 对每个 gt 限制最大 assigned anchors（max_per_gt = min(topk, 9)）
+      - 当 topk == 1 时，使用贪心质量排序保证一对一匹配（不允许一个 anchor 分配给多个 gt）
+      - 质量度量 quality = (pred_score_for_assigned_class ** cls_power) * (IoU ** iou_power)
     """
     device = pred_scores.device
     B, N, C = pred_scores.shape
-    _, _, _ = pred_bboxes.shape  # (B,N,4)
-    _, G = gt_bboxes.shape[0], gt_bboxes.shape[1] if gt_bboxes.dim() == 3 else (0,0)
 
-    # outputs
-    target_scores = torch.zeros_like(pred_scores, device=device)  # (B,N,C)
-    target_bboxes = torch.zeros_like(pred_bboxes, device=device)  # (B,N,4)
+    target_scores = torch.zeros_like(pred_scores, device=device)
+    target_bboxes = torch.zeros((B, N, 4), device=device)
     fg_mask = torch.zeros((B, N), dtype=torch.bool, device=device)
     matched_gt_inds = torch.full((B, N), -1, dtype=torch.long, device=device)
 
-    # process batch element-wise
+    eps = 1e-8
+    # ensure minimal IoU for positives: prefer at least 0.12 unless caller requests higher threshold
+    min_iou_for_pos = max(min_iou_for_candidate, 0.12)
+
+    def is_prob_tensor(x: torch.Tensor):
+        return float(x.min()) >= -1e-6 and float(x.max()) <= 1.0 + 1e-6
+
     for b in range(B):
-        gt_b = gt_bboxes[b]        # (G,4)
-        gt_l = gt_labels[b]        # (G,)
-        if gt_b.numel() == 0:
+        gt_b_all = gt_bboxes[b]  # (G,4) or maybe empty tensor
+        gt_l_all = gt_labels[b]  # (G,)
+        valid_mask = gt_l_all >= 0
+        if not valid_mask.any():
+            if debug:
+                print(f"[TAL] batch {b}: no valid gt")
             continue
 
-        pb = pred_bboxes[b]        # (N,4)
-        ps = pred_scores[b]        # (N,C)
-        # 1) IoU matrix (N, G) -- use bbox_iou (broadcast-friendly)
-        ious = bbox_iou(pb, gt_b)  # (N, G)
+        valid_idx = valid_mask.nonzero(as_tuple=False).squeeze(1)
+        gt_b = gt_b_all[valid_idx]   # (Gv,4)
+        gt_l = gt_l_all[valid_idx]   # (Gv,)
+        Gv = gt_b.shape[0]
 
-        # 2) classification score per (N, G): take predicted probability for each GT label
-        #    apply sigmoid to logits to get probability in [0,1]
-        prob = ps.sigmoid()        # (N, C)
-        # 构建 (G, C) 独热编码，用于 gt 标签，因此概率 @ one_hot.T -> (N,G) 选择标签概率
-        gt_one_hot = F.one_hot(gt_l.long(), num_classes=C).float()  # (G, C)
-        cls_score = prob @ gt_one_hot.T                            # (N, G)
+        pb = pred_bboxes[b]   # (N,4)
+        ps = pred_scores[b]   # (N,C)
 
-        # 3) 度量矩阵
-        align_metric = (cls_score.clamp(min=1e-8) ** cls_power) * (ious.clamp(min=1e-8) ** iou_power)  # (N, G)
+        # IoU matrix (N, Gv)
+        ious = bbox_iou(pb, gt_b).clamp(min=0.0, max=1.0)
 
-        # 4) 对于每个 GT，根据 align_metric 选择前 k 个锚框
+        # classification probability safe conversion
+        if use_softmax:
+            if is_prob_tensor(ps) and torch.allclose(ps.sum(dim=1), torch.ones(ps.shape[0], device=device), atol=1e-3):
+                prob = ps
+            else:
+                prob = F.softmax(ps, dim=1)
+        else:
+            if is_prob_tensor(ps):
+                prob = ps
+            else:
+                prob = torch.sigmoid(ps)
+
+        # cls_score: for each anchor and each gt, probability of gt's class
+        gt_one_hot = F.one_hot(gt_l.long(), num_classes=C).float().to(device)  # (Gv, C)
+        cls_score = prob @ gt_one_hot.t()  # (N, Gv)
+        cls_score = cls_score.clamp(min=eps, max=1.0)
+
+        # alignment metric: cls^cls_power * iou^iou_power
+        align_metric = (cls_score ** cls_power) * (ious.clamp(min=eps) ** iou_power)
+        align_metric = torch.nan_to_num(align_metric, nan=0.0, posinf=1e6, neginf=0.0)
+
+        # prepare for topk selection: filter by candidate IoU threshold
+        am_for_topk = align_metric.clone()
+        am_for_topk[ious < min_iou_for_candidate] = -1e9
+
+        # candidate_mask: (N, Gv)
+        candidate_mask = torch.zeros_like(am_for_topk, dtype=torch.bool)
+
+        # anchor centers and gt centers/sizes for center constraint
+        pb_centers = (pb[:, :2] + pb[:, 2:]) / 2.0
+        gt_centers = (gt_b[:, :2] + gt_b[:, 2:]) / 2.0
+        gt_wh = (gt_b[:, 2:] - gt_b[:, :2]).clamp(min=1e-6)
+        gt_radius = gt_wh.max(dim=1)[0] * center_radius
+
         k = min(topk, N)
-        # topk over dim=0 gives topk anchors for each GT -> returns (k, G) values/indices
-        topk_vals, topk_idx = align_metric.topk(k=k, dim=0, largest=True)  # topk_idx: (k, G)
-        # 构建 bool 掩码 (N, G)，标记每个 GT 的候选锚框。
-        candidate_mask = torch.zeros_like(align_metric, dtype=torch.bool)  # (N,G)
-        # [None, :] 是增加维度操作，将原本的 1D 张量 (K,) 变成 2D 张量 (1, K)，方便与 topk_idx 的形状 (N, K) 广播匹配。
-        candidate_mask[topk_idx, torch.arange(topk_idx.size(1), device=device)[None, :]] = True
+        # per-gt candidate selection (topk with center constraint)
+        for gi in range(Gv):
+            if use_center_constraint:
+                d = ((pb_centers - gt_centers[gi]) ** 2).sum(dim=1).sqrt()
+                center_ok = d <= gt_radius[gi]
+                inside_x = (pb_centers[:, 0] >= gt_b[gi, 0]) & (pb_centers[:, 0] <= gt_b[gi, 2])
+                inside_y = (pb_centers[:, 1] >= gt_b[gi, 1]) & (pb_centers[:, 1] <= gt_b[gi, 3])
+                inside_box = inside_x & inside_y
+                allow = center_ok | inside_box
+            else:
+                allow = torch.ones((N,), dtype=torch.bool, device=device)
 
-        # 5) determine final positive anchors:
-        # anchors that are candidate for any GT are positives (but may conflict)
-        # 主要用来标记正样本，即与任何 GT 有重叠的锚点
-        pos_mask_any = candidate_mask.any(dim=1)  # (N,)
-        fg_mask[b] = pos_mask_any
+            vals = am_for_topk[:, gi].clone()
+            vals[~allow] = -1e9
+            if (vals > -1e8).sum() == 0:
+                continue
+            topk_vals, topk_idx = vals.topk(k=k, largest=True)
+            good_mask = topk_vals > -1e8
+            if good_mask.any():
+                candidate_mask[topk_idx[good_mask], gi] = True
 
+        # if no candidates -> continue
+        pos_mask_any = candidate_mask.any(dim=1)
         if pos_mask_any.sum() == 0:
+            if debug:
+                print(f"[TAL] batch {b}: no candidate anchors after topk/center")
             continue
 
-        # 解决冲突：对于每个锚点，选择 align_metric 值最大的 GT
-        # 将非候选位置的 align_metric 值设置为 -inf，以便 argmax 仅在候选位置中选择
-        am = align_metric.clone()
-        am[~candidate_mask] = -1e9  # ignore non-candidates
-        # matched_gt for each anchor: argmax over G -> value in [0,G-1]
-        matched = am.argmax(dim=1)  # (N,)
-        matched_scores = am.max(dim=1)[0]  # chosen align metric per anchor
+        # Build list of candidate pairs and their quality for conflict resolution
+        # quality = align_metric (already computed), but we will combine with IoU again if needed
+        # Candidate indices:
+        cand_anchor_idx, cand_gt_idx = torch.where(candidate_mask)  # tensors of same length M
+        if cand_anchor_idx.numel() == 0:
+            if debug:
+                print(f"[TAL] batch {b}: no candidates after topk filtering")
+            continue
 
-        # 那些并非候选锚点的匹配分数将为 -1e9；我们必须将它们屏蔽掉。
-        valid_pos = matched_scores > -1e9
+        qualities = align_metric[cand_anchor_idx, cand_gt_idx]  # (M,)
 
-        # set outputs for valid positives
-        pos_idxs = valid_pos.nonzero(as_tuple=False).squeeze(1)
-        if pos_idxs.numel() > 0:
-            # 填充匹配的 gt 索引
-            matched_gt_inds[b, pos_idxs] = matched[pos_idxs].long()
-            # 分配边界框和类别目标
-            assigned_gt_idx = matched[pos_idxs].long()  # GT 下标
-            target_bboxes[b, pos_idxs] = gt_b[assigned_gt_idx]  # (P,4)
-            # 独热编码分类（硬独热编码，按对齐指标加权）
-            # 构建独热编码并乘以对齐分数作为软目标（可与 BCE 损失一起使用）
-            assigned_labels = gt_l[assigned_gt_idx]  # (P,)
-            # 将指定标签的独热码设置为 1.0
-            target_scores[b, pos_idxs, assigned_labels] = 1.0
-            # 每个锚点的权重（可选择对每个锚点的重量进行标准化）
-            weights = matched_scores[pos_idxs].clamp(min=0)
-            # Normalize weights to [0,1] by dividing by max (avoid division by zero)
-            if weights.numel() > 0:
-                wmax = weights.max()
-                if wmax > 0:
-                    weights = weights / (wmax + 1e-12)
-            # apply weights to target_scores for these anchors
-            target_scores[b, pos_idxs] = target_scores[b, pos_idxs] * weights.unsqueeze(-1)
+        # We'll perform matching differently depending on topk:
+        # - if topk == 1: enforce one-to-one matching via greedy by quality
+        # - if topk > 1: allow multiple anchors per gt but cap via max_per_gt (min(topk,9))
+        max_per_gt = min(max(1, topk), 9)
+
+        # Prepare structures to collect accepted matches
+        accepted_anchor_idx = []
+        accepted_gt_idx = []
+        accepted_quality = []
+
+        if topk == 1:
+            # Greedy one-to-one: sort candidate pairs by quality desc, accept if anchor free and gt free
+            M = qualities.shape[0]
+            if M == 0:
+                continue
+            # sort descending
+            sorted_vals, order = torch.sort(qualities, descending=True)
+            anc_sorted = cand_anchor_idx[order]
+            gt_sorted = cand_gt_idx[order]
+            anchor_taken = torch.zeros((N,), dtype=torch.bool, device=device)
+            gt_taken = torch.zeros((Gv,), dtype=torch.bool, device=device)
+            for i_idx in range(M):
+                a = int(anc_sorted[i_idx].item()); g = int(gt_sorted[i_idx].item())
+                if anchor_taken[a] or gt_taken[g]:
+                    continue
+                # check IoU quality threshold again
+                if ious[a, g] < min_iou_for_pos:
+                    continue
+                accepted_anchor_idx.append(a)
+                accepted_gt_idx.append(g)
+                accepted_quality.append(float(sorted_vals[i_idx].item()))
+                anchor_taken[a] = True
+                gt_taken[g] = True
+
+        else:
+            # topk > 1: allow multiple anchors per gt but cap max_per_gt
+            # For each gt, select up to max_per_gt anchors by quality, additionally ensure these anchors pass min_iou_for_pos
+            for gi in range(Gv):
+                # anchors candidate for this gt
+                mask_for_gt = cand_gt_idx == gi
+                if mask_for_gt.sum().item() == 0:
+                    continue
+                a_idxs = cand_anchor_idx[mask_for_gt]
+                q_vals = qualities[mask_for_gt]
+                # filter by min_iou_for_pos
+                keep_mask = ious[a_idxs, gi] >= min_iou_for_pos
+                if keep_mask.sum().item() == 0:
+                    continue
+                a_keep = a_idxs[keep_mask]
+                q_keep = q_vals[keep_mask]
+                k2 = min(max_per_gt, a_keep.numel())
+                topk_vals, topk_idx = torch.topk(q_keep, k=k2, largest=True)
+                chosen_anchors = a_keep[topk_idx]
+                for ii in range(chosen_anchors.numel()):
+                    accepted_anchor_idx.append(int(chosen_anchors[ii].item()))
+                    accepted_gt_idx.append(gi)
+                    accepted_quality.append(float(topk_vals[ii].item()))
+
+            # Note: the same anchor may be accepted for multiple gts here (rare if min_iou_for_pos is set).
+            # We'll resolve duplicates by keeping the GT with highest quality for that anchor.
+            if len(accepted_anchor_idx) > 0:
+                # convert to tensors
+                anc = torch.tensor(accepted_anchor_idx, dtype=torch.long, device=device)
+                gtids = torch.tensor(accepted_gt_idx, dtype=torch.long, device=device)
+                quals = torch.tensor(accepted_quality, dtype=torch.float, device=device)
+                # group by anchor and keep best gt per anchor
+                unique_anchors = torch.unique(anc)
+                final_anc = []
+                final_gt = []
+                final_q = []
+                for ua in unique_anchors:
+                    mask = (anc == ua)
+                    sub_q = quals[mask]
+                    sub_gt = gtids[mask]
+                    best_idx = torch.argmax(sub_q)
+                    final_anc.append(int(ua.item()))
+                    final_gt.append(int(sub_gt[best_idx].item()))
+                    final_q.append(float(sub_q[best_idx].item()))
+                accepted_anchor_idx = final_anc
+                accepted_gt_idx = final_gt
+                accepted_quality = final_q
+
+        # now populate matched arrays for this image
+        if len(accepted_anchor_idx) == 0:
+            if debug:
+                print(f"[TAL] batch {b}: no accepted matches after resolution")
+            continue
+
+        anc_tensor = torch.tensor(accepted_anchor_idx, dtype=torch.long, device=device)
+        gt_tensor = torch.tensor(accepted_gt_idx, dtype=torch.long, device=device)
+        qual_tensor = torch.tensor(accepted_quality, dtype=torch.float, device=device)
+
+        # map gt_tensor (index into valid_gt list) back to original gt indices in batch
+        matched_orig_idx = valid_idx[gt_tensor]  # indices in original gt list (for this image)
+        matched_gt_inds[b, anc_tensor] = matched_orig_idx.long()
+
+        # fill target_bboxes and target_scores for assigned anchors
+        # target_bboxes should contain the assigned gt box (using valid local index)
+        target_bboxes[b, anc_tensor] = gt_b[gt_tensor]
+
+        # assigned labels
+        assigned_labels = gt_l[gt_tensor].long()  # local label ids
+        # set only the assigned-class position to 1 (others remain 0)
+        target_scores[b, anc_tensor, assigned_labels] = 1.0
+
+        # turn qual_tensor into normalized weights (per-image)
+        w = qual_tensor.clone().detach()
+        w = torch.clamp(w, min=0.0)
+        maxw = w.max() if w.numel() > 0 else 1.0
+        if maxw > 0:
+            w = w / (maxw + eps)
+        else:
+            w = torch.ones_like(w)
+        # stabilize distribution (sqrt)
+        w = torch.sqrt(w)
+
+        # multiply only the assigned class position (target_scores currently has 1 at assigned class)
+        # using broadcasting: target_scores[b, anc_tensor] is (K, C) with one-hot; multiply rows by w
+        target_scores[b, anc_tensor] = target_scores[b, anc_tensor] * w.unsqueeze(-1)
+
+        # mark fg_mask for these anchors
+        fg_mask[b, anc_tensor] = True
+
+        if debug:
+            print(f"[TAL debug] batch {b}: accepted {len(accepted_anchor_idx)} positives, max quality {float(qual_tensor.max()):.6f}")
 
     return target_scores, target_bboxes, fg_mask, matched_gt_inds

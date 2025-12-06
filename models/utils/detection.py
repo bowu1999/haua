@@ -102,23 +102,30 @@ def decode_dfl(
     reg_max: int = 16,
     stride: int = 1,
     grid: Optional[torch.Tensor] = None,
-    apply_softmax: bool = True
+    apply_softmax: bool = True,
+    img_size: Optional[Tuple[int, int]] = None,
+    adjust_dist: bool = False,
+    eps: float = 1e-6
 ):
     """
-    通用强化版 DFL 解码函数，兼容 YOLOv5/8/10/11 风格，以及任意输入 shape：
+    通用强化版 DFL 解码函数，兼容 YOLOv5/8/10/11 风格，以及任意输入 shape:
         - (B, 4*reg_max, H, W)
         - (B, 4, reg_max, H, W)
+    增加了 bbox 裁剪防溢出功能 (clip to image bounds)
 
     Args:
-        pred_reg (Tensor): 模型输出的回归预测。
-        reg_max (int): DFL bins 数量。
-        stride (int): 当前尺度的 stride。
-        grid (Tensor | None): 锚点坐标，可为 (H,W,2) 或 (N,2)，若为 None 会自动生成。
+        pred_reg (Tensor): 模型输出的回归预测
+        reg_max (int): DFL bins 数量
+        stride (int): 当前尺度的 stride
+        grid (Tensor | None): 锚点坐标，可为 (H,W,2) 或 (N,2)，若为 None 会自动生成
         apply_softmax (bool): 是否对 bins 维度做 softmax。
-
+        img_size (tuple or None): (height, width) 原始图像尺寸（像素）,默认使用 (H*stride, W*stride)
+        adjust_dist (bool): 裁剪 boxes 后是否同时更新返回的 dist_pixels (默认为 False)
+        eps (float): 裁剪时避免等于边界的微小数值
+    
     Returns:
-        boxes (Tensor): (B, H*W, 4) xyxy
-        dist_pixels (Tensor): (B,4,H,W)
+        boxes (Tensor): (B, N, 4) xyxy (已经裁剪)
+        dist_pixels (Tensor): (B,4,H,W) 若 adjust_dist=True 则为裁剪后对应的 dist,否则为原始解码的 dist
     """
     device = pred_reg.device
     dtype = pred_reg.dtype
@@ -153,6 +160,7 @@ def decode_dfl(
         grid = grid.reshape(N, 2).to(dtype)
     else: # grid 支持 (H,W,2) or (N,2) 
         if grid.dim() == 3:
+            # assume (H,W,2)
             grid = grid.reshape(N, 2)
         grid = grid.to(device=device, dtype=dtype)
     # 4. 计算 x1y1x2y2
@@ -169,8 +177,34 @@ def decode_dfl(
     boxes = torch.stack([x1, y1, x2, y2], dim=-1)  # (B,N,4)
     # 5. 同时输出 dist_pixels: (B,4,H,W)
     dist_pixels = dist.reshape(B, H, W, 4).permute(0, 3, 1, 2)
+    # 6. 裁剪 boxes 防止溢出（clip）
+    if img_size is None:
+        img_h = float(H * stride)
+        img_w = float(W * stride)
+    else:
+        img_h, img_w = float(img_size[0]), float(img_size[1])
+    # 裁剪到 [0, img_w - eps], [0, img_h - eps]
+    x1_clipped = boxes[..., 0].clamp(min=0.0 + eps, max=img_w - eps)
+    y1_clipped = boxes[..., 1].clamp(min=0.0 + eps, max=img_h - eps)
+    x2_clipped = boxes[..., 2].clamp(min=0.0 + eps, max=img_w - eps)
+    y2_clipped = boxes[..., 3].clamp(min=0.0 + eps, max=img_h - eps)
+    # 确保 x2 >= x1, y2 >= y1
+    x2_clipped = torch.max(x2_clipped, x1_clipped)
+    y2_clipped = torch.max(y2_clipped, y1_clipped)
+    boxes_clipped = torch.stack([x1_clipped, y1_clipped, x2_clipped, y2_clipped], dim=-1)  # (B,N,4)
+    # 可选：根据裁剪后的 boxes 更新 dist_pixels（l,t,r,b）
+    if adjust_dist:
+        # 重新计算 l,t,r,b: l = cx - x1_clipped, r = x2_clipped - cx, ...
+        # 注意 cx,cy shape: (B,N)
+        l_new = (cx - x1_clipped).clamp(min=0.0)
+        t_new = (cy - y1_clipped).clamp(min=0.0)
+        r_new = (x2_clipped - cx).clamp(min=0.0)
+        b_new = (y2_clipped - cy).clamp(min=0.0)
+        # 合并并 reshape 为 (B,4,H,W)
+        dist_new = torch.stack([l_new, t_new, r_new, b_new], dim=-1)  # (B,N,4)
+        dist_pixels = dist_new.reshape(B, H, W, 4).permute(0, 3, 1, 2)
 
-    return boxes, dist_pixels
+    return boxes_clipped, dist_pixels
 
 
 def dist2bbox(distance, anchor_points, xywh=True, dim=-1):
@@ -284,92 +318,38 @@ def bbox2dist(
     return dist
 
 
-def bbox_iou(box1: torch.Tensor, box2: torch.Tensor, xywh: bool = False, CIoU: bool = False, eps: float = 1e-7) -> torch.Tensor:
+def bbox_iou(boxes1: torch.Tensor, boxes2: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     """
-    Compute IoU or CIoU between box1 and box2.
-    - box1: (N,4)
-    - box2: (M,4) or (N,4)
-    - if shapes match (N==M) -> returns (N,) (elementwise)
-    - else -> returns (N,M) IoU matrix (CIoU not computed in pairwise case)
-    - xywh: if True, inputs are (cx,cy,w,h)
-    - CIoU: if True and shapes match, compute CIoU (per-element)
+    boxes1: (N,4) xyxy
+    boxes2: (M,4) xyxy
+    returns IoU: (N,M)
     """
-    if xywh:
-        box1 = xywh2xyxy(box1)
-        box2 = xywh2xyxy(box2)
+    if boxes1.numel() == 0 or boxes2.numel() == 0:
+        return torch.zeros((boxes1.shape[0], boxes2.shape[0]), device=boxes1.device, dtype=boxes1.dtype)
+    N = boxes1.shape[0]
+    M = boxes2.shape[0]
+    # expand
+    b1_x1 = boxes1[:, 0].unsqueeze(1).expand(N, M)
+    b1_y1 = boxes1[:, 1].unsqueeze(1).expand(N, M)
+    b1_x2 = boxes1[:, 2].unsqueeze(1).expand(N, M)
+    b1_y2 = boxes1[:, 3].unsqueeze(1).expand(N, M)
+    b2_x1 = boxes2[:, 0].unsqueeze(0).expand(N, M)
+    b2_y1 = boxes2[:, 1].unsqueeze(0).expand(N, M)
+    b2_x2 = boxes2[:, 2].unsqueeze(0).expand(N, M)
+    b2_y2 = boxes2[:, 3].unsqueeze(0).expand(N, M)
+    inter_x1 = torch.max(b1_x1, b2_x1)
+    inter_y1 = torch.max(b1_y1, b2_y1)
+    inter_x2 = torch.min(b1_x2, b2_x2)
+    inter_y2 = torch.min(b1_y2, b2_y2)
+    inter_w = (inter_x2 - inter_x1).clamp(min=0)
+    inter_h = (inter_y2 - inter_y1).clamp(min=0)
+    inter_area = inter_w * inter_h
+    area1 = (b1_x2 - b1_x1).clamp(min=0) * (b1_y2 - b1_y1).clamp(min=0)
+    area2 = (b2_x2 - b2_x1).clamp(min=0) * (b2_y2 - b2_y1).clamp(min=0)
+    union = area1 + area2 - inter_area
+    iou = inter_area / (union + eps)
 
-    # ensure last dim is 4
-    assert box1.shape[-1] == 4 and box2.shape[-1] == 4
-
-    N = box1.shape[0]
-    M = box2.shape[0]
-
-    # elementwise case (N == M) -> produce (N,)
-    if N == M:
-        x1 = torch.max(box1[:, 0], box2[:, 0])
-        y1 = torch.max(box1[:, 1], box2[:, 1])
-        x2 = torch.min(box1[:, 2], box2[:, 2])
-        y2 = torch.min(box1[:, 3], box2[:, 3])
-
-        inter_w = (x2 - x1).clamp(min=0)
-        inter_h = (y2 - y1).clamp(min=0)
-        inter = inter_w * inter_h
-
-        area1 = ((box1[:, 2] - box1[:, 0]).clamp(min=0)) * ((box1[:, 3] - box1[:, 1]).clamp(min=0))
-        area2 = ((box2[:, 2] - box2[:, 0]).clamp(min=0)) * ((box2[:, 3] - box2[:, 1]).clamp(min=0))
-        union = area1 + area2 - inter
-        iou = inter / union.clamp(min=eps)
-
-        if not CIoU:
-            return iou
-
-        # --- CIoU terms (per-element) ---
-        # center distance
-        c_x1 = (box1[:, 0] + box1[:, 2]) / 2
-        c_y1 = (box1[:, 1] + box1[:, 3]) / 2
-        c_x2 = (box2[:, 0] + box2[:, 2]) / 2
-        c_y2 = (box2[:, 1] + box2[:, 3]) / 2
-        center_dist2 = (c_x1 - c_x2) ** 2 + (c_y1 - c_y2) ** 2
-
-        # smallest enclosing box
-        enc_x1 = torch.min(box1[:, 0], box2[:, 0])
-        enc_y1 = torch.min(box1[:, 1], box2[:, 1])
-        enc_x2 = torch.max(box1[:, 2], box2[:, 2])
-        enc_y2 = torch.max(box1[:, 3], box2[:, 3])
-        enc_w = (enc_x2 - enc_x1).clamp(min=0)
-        enc_h = (enc_y2 - enc_y1).clamp(min=0)
-        c2 = enc_w ** 2 + enc_h ** 2 + eps
-
-        # aspect ratio term v and weighting factor alpha
-        w1 = (box1[:, 2] - box1[:, 0]).clamp(min=eps)
-        h1 = (box1[:, 3] - box1[:, 1]).clamp(min=eps)
-        w2 = (box2[:, 2] - box2[:, 0]).clamp(min=eps)
-        h2 = (box2[:, 3] - box2[:, 1]).clamp(min=eps)
-
-        # v measure
-        atan1 = torch.atan(w1 / h1)
-        atan2 = torch.atan(w2 / h2)
-        v = (4 / (torch.pi ** 2)) * (atan1 - atan2) ** 2
-        with torch.no_grad():
-            alpha = v / (1.0 - iou + v + eps)
-
-        ciou = iou - (center_dist2 / c2) - alpha * v
-        return ciou
-
-    # pairwise IoU matrix case (N,M)
-    # compute pairwise intersections
-    lt = torch.max(box1[:, None, :2], box2[None, :, :2])  # (N,M,2)
-    rb = torch.min(box1[:, None, 2:], box2[None, :, 2:])  # (N,M,2)
-    wh = (rb - lt).clamp(min=0)
-    inter = wh[..., 0] * wh[..., 1]
-    area1 = ((box1[:, 2] - box1[:, 0]).clamp(min=0))[:, None]
-    area2 = ((box2[:, 2] - box2[:, 0]).clamp(min=0))[None, :]
-    union = area1 + area2 - inter
-    iou_matrix = inter / union.clamp(min=eps)
-    if CIoU:
-        # CIoU for pairwise would be expensive and is rarely expected; fall back to IoU matrix
-        return iou_matrix
-    return iou_matrix
+    return iou
 
 
 def pairwise_iou(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
