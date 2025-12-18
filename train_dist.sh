@@ -2,7 +2,8 @@
 
 # 设置要使用的 GPU
 all_gpu_ids=$(nvidia-smi --query-gpu=index --format=csv,noheader | tr '\n' ',' | sed 's/,$//')
-script=$1
+path=$1
+script=$(echo $path | sed 's/\.py$//; s/\//./g')
 config=$2
 if [ -z "$3" ]; then
     GPUS=$all_gpu_ids

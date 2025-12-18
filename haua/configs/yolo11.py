@@ -9,32 +9,31 @@ model = dict(type='TrainYOLO11',
         strides = [8, 16, 32],
         num_classes = 80,
         dfl_bins = 16,
-        loss_cls_weight = 1.,
+        loss_cls_weight = 0.5,
         loss_iou_weight = 7.5,
         loss_dfl_weight = 1.5,
-        tal_topk = 10,
-        use_focal = True,          # focal for BCE path
-        focal_alpha = 0.25,
-        focal_gamma = 1.0,
-        debug = False,
-        # hard-neg 采样和正负样本权重
-        neg_pos_ratio = 1,
-        neg_thresh = 0.05,
-        pos_weight = 3.0,
-        neg_weight = 0.5,
-        # new control params
-        pos_loss_type = 'bce',   # 'bce' (default) or 'ce' (softmax CE focal)
-        use_neg_loss = True,
-        neg_selection = 'per_image',
+        cls_loss_type = "bce",
         label_smoothing = 0.0,
-        o2m_weight = .8))
+        use_focal = False,
+        focal_alpha = 0.25,
+        focal_gamma = 2.0,
+        debug = False,
+        o2m_weight = 0.8,
+        pos_cls_weight = 1.0,
+        neg_cls_weight = 0.1))
 
-work_dir = '/lpai/volumes/vc-profile-bd-ga/others/wubo/Projects/Code/011-computer-version/myyolo/work_dirs/yolo11'
+work_dir = (
+    "/mnt/volumes/vc-profile-bd-ga/others/wubo/Projects/Code/011-computer-version/haua/work_dirs"
+    "/yolo11")
 
 train_dataloader = dict(
     dataset=dict(type='YOLOCOCO',
-        root = "/lpai/volumes/vc-profile-bd-ga/others/yanxiaobao/datasets/COCO2017/train2017",
-        ann_file = "/lpai/volumes/vc-profile-bd-ga/others/yanxiaobao/datasets/COCO2017/annotations/instances_train2017.json"),
+        root = (
+            "/lpai/volumes/vc-profile-bd-ga/others/wubo/Datasets/OpenDataLab___COCO_2017/raw/Images"
+            "/train2017"),
+        ann_file = (
+            "/lpai/volumes/vc-profile-bd-ga/others/wubo/Datasets/OpenDataLab___COCO_2017/raw"
+            "/Annotations/instances_train2017.json")),
     sampler=dict(type='DefaultSampler', shuffle=True),
     collate_fn=dict(type='coco_collate'),
     batch_size=64,
@@ -72,8 +71,12 @@ param_scheduler = [
 
 # val_dataloader = dict(
 #     dataset=dict(type='YOLOCOCO',
-#         root = "/lpai/volumes/vc-profile-bd-ga/others/yanxiaobao/datasets/COCO2017/val2017",
-#         ann_file = "/lpai/volumes/vc-profile-bd-ga/others/yanxiaobao/datasets/COCO2017/annotations/instances_val2017.json"),
+#         root = (
+        #     "/lpai/volumes/vc-profile-bd-ga/others/wubo/Datasets/OpenDataLab___COCO_2017/raw/Images"
+        #     "/val2017"),
+        # ann_file = (
+        #     "/lpai/volumes/vc-profile-bd-ga/others/wubo/Datasets/OpenDataLab___COCO_2017/raw"
+        #     "/Annotations/instances_val2017.json")),
 #     sampler=dict(type='DefaultSampler', shuffle=False),
 #     collate_fn=dict(type='default_collate'),
 #     batch_size=128,

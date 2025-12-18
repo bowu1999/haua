@@ -18,6 +18,9 @@ ENV/
 *.tmp
 temp/
 tmp/
+work_dirs/
+jupyters/
+haua.egg-info/
 
 # 操作系统
 .DS_Store

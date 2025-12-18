@@ -45,9 +45,15 @@ class TrainYOLO11(BaseModel):
         self,
         backbone_config: dict,
         loss_config: dict,
+        init_checkpoint = (
+            "/lpai/volumes/vc-profile-bd-ga/others/wubo/Projects/Code/011-computer-version/haua"
+            "/work_dirs/yolo11/init_state_dict.pth")
     ):
         super().__init__()
         self.backbone = Yolo11_train(**backbone_config)
+        if init_checkpoint is not None:
+            init_static_dict = torch.load(init_checkpoint)
+            self.backbone.load_state_dict(init_static_dict)
         self.loss_module = YOLOv10Loss(**loss_config)
 
     def forward(self, inputs, data_samples=None, mode: str = "tensor"): # type: ignore
