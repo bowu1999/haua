@@ -6,7 +6,7 @@ from mmengine.runner import Runner
 from mmengine.dist import init_dist
 
 
-def main():
+def hauarun():
     # 解析命令行参数
     parser = argparse.ArgumentParser(description='Train/Test script for HWP model')
     parser.add_argument('--config', type=str, required=True, help='Path to configuration file')
@@ -36,4 +36,4 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    hauarun()

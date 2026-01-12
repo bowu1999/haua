@@ -6,6 +6,7 @@ from typing import List, Optional, Tuple, Union
 from .iou import ciou_loss
 from .assigner import tal_assign
 from ..models.utils import make_grid, decode_dfl, bbox_iou, bbox_area
+from .seg import InstanceSegLoss
 
 
 class YOLOv8Loss(nn.Module):
@@ -26,6 +27,7 @@ class YOLOv8Loss(nn.Module):
         debug: bool = False,
         pos_cls_weight: float = 1.0,
         neg_cls_weight: float = 0.1,     # 降低负样本权重，避免负样本主导
+        return_midvars: bool = False,
     ):
         """
         更接近 YOLOv8 风格的损失实现：
@@ -47,7 +49,7 @@ class YOLOv8Loss(nn.Module):
         self.focal_gamma = focal_gamma
         self.tal_topk = tal_topk
         self.debug = debug
-
+        self.return_midvars = return_midvars
         self.pos_cls_weight = pos_cls_weight
         self.neg_cls_weight = neg_cls_weight
 
@@ -211,9 +213,8 @@ class YOLOv8Loss(nn.Module):
 
         # ============ 匹配（Task-Aligned Assigner） ============
         with torch.no_grad():
-            # 官方使用的就是 pred_cls.sigmoid 作为分类置信度
+            # 使用 pred_cls.sigmoid 作为分类置信度
             cls_prob = all_cls_logits.sigmoid()    # (B, N_tot, C)
-
             # target_scores: (B, N_tot, C)
             # target_bboxes: (B, N_tot, 4)
             # fg_mask:       (B, N_tot) bool/0-1
@@ -243,19 +244,17 @@ class YOLOv8Loss(nn.Module):
                 stride_map)        # (N_tot,)
             pred_dfl_pos = all_dfl[pos_mask]          # (P,4,bins)
             targ_dfl_pos = target_dfl_all[pos_mask]   # (P,4,bins)
-            # 官方实现等价于：对每个方向上的 (bins) 做 softmax + 交叉熵
+            # 对每个方向上的 (bins) 做 softmax + 交叉熵
             log_probs = F.log_softmax(pred_dfl_pos, dim=-1)
             # P*4*bins 上求和，然后按正样本数归一化
             loss_dfl = -(targ_dfl_pos * log_probs).sum() / num_pos_den
         else:
             loss_dfl = torch.tensor(0.0, device=device)
 
-        # ==================== 分类损失（官方风格）=====================
         # 注意：官方直接使用 target_scores 作为 BCE/Focal 的 target
         # target_scores: (B, N_tot, C)，正样本对应类别 > 0，其他为 0
         # 负样本在所有类别上都为 0
         if self.label_smoothing > 0:
-            # 官方原版没有严格这么写 label smoothing；
             # 如需保留，可对正样本的非零 scores 做缩放，下面是一个温和版本：
             # target' = target * (1 - ε) + ε/C
             eps = self.label_smoothing
@@ -263,14 +262,13 @@ class YOLOv8Loss(nn.Module):
             non_zero_mask = target_scores > 0
             target_scores = target_scores * (1.0 - eps)
             # 均匀分布加到所有类上，严格模仿 one-hot smoothing 的话是加到全体；
-            # 但官方 v8 并未显式引入 label_smoothing，你也可以直接关闭这一项。
             target_scores = target_scores + eps / self.num_classes
 
         pred_cls = all_cls_logits.reshape(-1, self.num_classes)       # (B*N_tot, C)
         target_cls = target_scores.reshape(-1, self.num_classes)      # (B*N_tot, C)
 
         if self.use_focal:
-            # 使用你自定义的 sigmoid_focal_loss
+            # 使用 sigmoid_focal_loss
             loss_cls_raw = self.sigmoid_focal_loss(
                 pred_cls, target_cls,
                 alpha=self.focal_alpha,
@@ -282,11 +280,18 @@ class YOLOv8Loss(nn.Module):
             loss_cls_raw = F.binary_cross_entropy_with_logits(
                 pred_cls, target_cls, reduction='sum')
             loss_cls = loss_cls_raw / num_pos_den
-
-        return {
+        
+        result = {
             "box": self.loss_iou_weight * loss_iou,
             "dfl": self.loss_dfl_weight * loss_dfl,
             "cls": self.loss_cls_weight * loss_cls}
+
+        if self.return_midvars:
+            result['fg_mask'] = fg_mask
+            result['matched_gt_inds'] = matched_gt_inds
+            result['all_grids'] = all_grids
+
+        return result
 
 
 class YOLOv10Loss(nn.Module):
@@ -355,5 +360,91 @@ class YOLOv10Loss(nn.Module):
             loss[f'loss_o2o_{k}'] = v * (1 - self.o2m_weight)
         for k, v in one2many_loss.items():
             loss[f'loss_o2m_{k}'] = v * self.o2m_weight
+
+        return loss
+
+
+class YOLOv11SegLoss(YOLOv10Loss):
+    def __init__(
+        self,
+        strides: list = [8, 16, 32],
+        num_classes: int = 80,
+        dfl_bins: int = 16,
+        loss_cls_weight: float = 0.5,
+        loss_iou_weight: float = 7.5,
+        loss_dfl_weight: float = 1.5,
+        cls_loss_type: str = "bce",
+        label_smoothing: float = 0.0,
+        use_focal: bool = True,
+        focal_alpha = 0.75,
+        focal_gamma = 2.0,
+        debug = False,
+        o2m_weight: float = 0.8,
+        pos_cls_weight: float = 1.0,
+        neg_cls_weight: float = 0.1,
+        loss_seg_weight: float = 1.0,
+    ):
+        super().__init__(
+            strides, num_classes, dfl_bins, loss_cls_weight, loss_iou_weight, loss_dfl_weight, 
+            cls_loss_type, label_smoothing, use_focal, focal_alpha, focal_gamma, debug, o2m_weight, 
+            pos_cls_weight, neg_cls_weight)
+        self.one2one_loss = YOLOv8Loss(
+            strides = strides,
+            num_classes = num_classes,
+            dfl_bins = dfl_bins,
+            loss_cls_weight = loss_cls_weight,
+            loss_iou_weight = loss_iou_weight,
+            loss_dfl_weight = loss_dfl_weight,
+            cls_loss_type = cls_loss_type,
+            label_smoothing = label_smoothing,
+            use_focal = use_focal,
+            focal_alpha = focal_alpha,
+            focal_gamma = focal_gamma,
+            debug = debug,
+            pos_cls_weight = pos_cls_weight,
+            neg_cls_weight = neg_cls_weight,
+            tal_topk = 1,
+            return_midvars = True)
+        self.seg_loss = InstanceSegLoss(
+            strides = strides,
+            num_protos = 32,
+            proto_size = (160, 160),
+            loss_seg_weight = loss_seg_weight,
+            use_dice = True)
+
+    def forward(self, preds, targs):
+        """
+        Args:
+            preds: {
+                'one2one': [...],
+                'one2many': [...],
+                'seg_out': (P3, P4, P5),    # each (B,32,Hs,Ws)
+                'prototype_mask': proto     # (B,32,160,160)
+            }
+            targs: 同之前 + 'gt_masks'
+        """
+        img_h, img_w = targs["img"].shape[-2:]
+        # ---- 检测损失 ----
+        o2o_out = self.one2one_loss(preds['one2one'], targs)
+        o2m_out = self.one2many_loss(preds['one2many'], targs)
+        loss = {}
+        for k in ["box", "dfl", "cls"]:
+            loss[f'loss_o2o_{k}'] = o2o_out[k] * (1 - self.o2m_weight)
+        for k in ["box", "dfl", "cls"]:
+            loss[f'loss_o2o_{k}'] = o2m_out[k] * self.o2m_weight
+        # ---- 实例分割损失（通常用 one2one 的匹配信息）----
+        fg_mask = o2o_out["fg_mask"]
+        matched_gt_inds = o2o_out["matched_gt_inds"]
+        # 如果需要 all_grids / strides 也可从 o2o_out 或 self.strides 获取
+        seg_loss = self.seg_loss(
+            seg_out = preds["seg_out"],
+            prototype_mask = preds["prototype_mask"],
+            fg_mask = fg_mask,
+            matched_gt_inds = matched_gt_inds,
+            gt_bboxes = targs["gt_bboxes"],
+            gt_masks = targs["gt_masks"],
+            img_shape = (img_h, img_w),
+            grids = None)   # 如需要，用 make_grid 重建或从 o2o_out["all_grids"] 传
+        loss["loss_seg"] = seg_loss
 
         return loss

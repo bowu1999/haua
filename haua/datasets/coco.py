@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Callable, List, Tuple, Optional, Dict, Any
+from typing import Callable, List, Tuple, Optional, Dict
 
 import json
 import math
@@ -10,9 +10,9 @@ import numpy as np
 
 import torch
 from torch import Tensor
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
+from pycocotools import mask as mask_utils
 import torchvision.transforms.functional as F
-
 try:
     from pycocotools.coco import COCO
 except Exception as e:
@@ -34,14 +34,16 @@ COCO_80_TO_ORIG = {i: orig for i, orig in enumerate(COCO80_ORIG_IDS)}
 
 # 标准 COCO 80 类名，索引 0..79 对应上面的 COCO80_ORIG_IDS 映射顺序
 coco80_names = [
- "person","bicycle","car","motorcycle","airplane","bus","train","truck","boat","traffic light",
- "fire hydrant","stop sign","parking meter","bench","bird","cat","dog","horse","sheep","cow",
- "elephant","bear","zebra","giraffe","backpack","umbrella","handbag","tie","suitcase","frisbee",
- "skis","snowboard","sports ball","kite","baseball bat","baseball glove","skateboard","surfboard","tennis racket","bottle",
- "wine glass","cup","fork","knife","spoon","bowl","banana","apple","sandwich","orange",
- "broccoli","carrot","hot dog","pizza","donut","cake","chair","couch","potted plant","bed",
- "dining table","toilet","tv","laptop","mouse","remote","keyboard","cell phone","microwave","oven",
- "toaster","sink","refrigerator","book","clock","vase","scissors","teddy bear","hair drier","toothbrush"]
+    "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat",
+    "traffic light", "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat", "dog",
+    "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella",
+    "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard", "sports ball", "kite",
+    "baseball bat", "baseball glove", "skateboard", "surfboard", "tennis racket", "bottle",
+    "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange",
+    "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair", "couch", "potted plant",
+    "bed", "dining table", "toilet", "tv", "laptop", "mouse", "remote", "keyboard", "cell phone",
+    "microwave", "oven", "toaster", "sink", "refrigerator", "book", "clock", "vase", "scissors", 
+    "teddy bear", "hair drier", "toothbrush"]
 
 
 def xywh2xyxy(boxes: np.ndarray) -> np.ndarray:
@@ -375,6 +377,118 @@ def coco_collate(batch):
     data_samples = {
         'gt_bboxes': gt_bboxes,
         'gt_labels': gt_labels}
+
+    return inputs, data_samples
+
+
+def _decode_single_seg(seg, H: int, W: int):
+    """
+    解码单个 COCO segmentation 对象为 (H, W) 的 0/1 numpy 数组。
+    seg 可能是：
+      - polygon: list[list[float]] 或 list[float]
+      - RLE dict: {'size':[H,W], 'counts':...}
+      - list of RLE dict
+    返回:
+      - m: np.ndarray (H, W) uint8{0,1}，若无法解析则返回 None
+    """
+    if seg is None:
+        return None
+    # polygon 或 list of polygon / RLE dict
+    if isinstance(seg, list):
+        if len(seg) == 0:
+            return None
+        # 如果元素是 dict，且有 'counts'，则视为 RLE 列表
+        if isinstance(seg[0], dict) and 'counts' in seg[0]:
+            try:
+                rles = seg
+                rle = mask_utils.merge(rles)
+                m = mask_utils.decode(rle)
+            except Exception:
+                return None
+        else:
+            # 否则视为 polygon 列表（标准 COCO segmentation）
+            try:
+                rles = mask_utils.frPyObjects(seg, H, W)
+                rle = mask_utils.merge(rles)
+                m = mask_utils.decode(rle)
+            except Exception:
+                return None
+    # 单个 RLE dict
+    elif isinstance(seg, dict) and 'counts' in seg and 'size' in seg:
+        try:
+            m = mask_utils.decode(seg)  # type: ignore
+        except Exception:
+            return None
+    else:
+        # 其他不认识的格式
+        return None
+    if m.ndim == 3:
+        m = m[..., 0]
+    return m  # np.ndarray (H, W)
+
+
+def coco_seg_collate(batch):
+    """
+    与 coco_collate 类似，但额外返回实例分割的 gt_masks。
+    返回:
+        inputs: Tensor [B, C, H, W]
+        data_samples: dict
+            - 'gt_bboxes': FloatTensor (B, M_max, 4)，0 填充
+            - 'gt_labels': LongTensor  (B, M_max)，-1 填充
+            - 'gt_masks':  FloatTensor (B, M_max, H, W)，0 填充
+            - 'num_gts':   LongTensor  (B,) 每张图真实实例个数
+    要求 Dataset 构造时 return_masks=True，使得 target['masks'] 为 COCO segmentation 列表。
+    """
+    images, targets = zip(*batch)
+    inputs = torch.stack(images, dim=0)  # [B,C,H,W]
+    batch_size, _, H, W = inputs.shape
+    # 每张图原始的实例数（按 boxes 数量）
+    num_boxes_per_img = [len(t['boxes']) for t in targets]
+    max_num_boxes = max(num_boxes_per_img) if batch_size > 0 else 0
+    gt_bboxes = torch.zeros((batch_size, max_num_boxes, 4), dtype=torch.float32)
+    gt_labels = -torch.ones((batch_size, max_num_boxes), dtype=torch.int64)  # 使用 -1 填充
+    # masks: (B, M_max, H, W)
+    gt_masks = torch.zeros((batch_size, max_num_boxes, H, W), dtype=torch.float32)
+    num_gts = torch.zeros((batch_size,), dtype=torch.long)
+    for i, target in enumerate(targets):
+        boxes_i: torch.Tensor = target['boxes']   # (Gi_box, 4)
+        labels_i: torch.Tensor = target['labels'] # (Gi_box,)
+        masks_i = target.get('masks', None)       # list length Gi_box or None
+        if masks_i is None or len(masks_i) == 0 or len(boxes_i) == 0:
+            # 没有实例，保持这一行全 0 / -1
+            num_gts[i] = 0
+            continue
+        assert len(masks_i) == len(boxes_i), \
+            "boxes 和 masks 数量不一致，请检查 Dataset.__getitem__"
+        filtered_boxes = []
+        filtered_labels = []
+        inst_masks: List[torch.Tensor] = []
+        # 对该图的每个实例做一致的过滤：seg decode 失败则该实例整体丢弃
+        for box, label, seg in zip(boxes_i, labels_i, masks_i):
+            m = _decode_single_seg(seg, H, W)
+            if m is None:
+                # segmentation 无法解析，该实例在检测和分割中都不使用
+                continue
+            m = torch.from_numpy(m.astype(np.float32))  # (H,W)
+            inst_masks.append(m)
+            filtered_boxes.append(box)
+            filtered_labels.append(label)
+        Gi_keep = len(inst_masks)
+        num_gts[i] = Gi_keep
+        if Gi_keep == 0:
+            # 这一图所有实例都被丢弃
+            continue
+        # 限制不要超过本 batch 的 max_num_boxes（正常不会超过）
+        Gi_keep = min(Gi_keep, max_num_boxes)
+        gt_bboxes[i, :Gi_keep] = torch.stack(filtered_boxes[:Gi_keep], dim=0)
+        gt_labels[i, :Gi_keep] = torch.stack(filtered_labels[:Gi_keep], dim=0)
+        gt_masks[i, :Gi_keep] = torch.stack(inst_masks[:Gi_keep], dim=0)  # (Gi_keep, H, W)
+    data_samples = {
+        'img': inputs,
+        'gt_bboxes': gt_bboxes,  # (B, M, 4)
+        'gt_labels': gt_labels,  # (B, M)
+        'gt_masks': gt_masks,    # (B, M, H, W)
+        'num_gts': num_gts}      # (B,)
 
     return inputs, data_samples
 

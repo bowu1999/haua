@@ -21,6 +21,7 @@ tmp/
 work_dirs/
 jupyters/
 haua.egg-info/
+model_files/
 
 # 操作系统
 .DS_Store

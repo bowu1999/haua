@@ -74,7 +74,6 @@ class YOLODetector(nn.Module):
         self.classify_hidden_channels = classify_hidden_channels \
             if isinstance(classify_hidden_channels, (tuple, list)) \
                 else (classify_hidden_channels,) * 3
-        heads = []
         if self.share_block:
             shared_head = DualBranchHead(
                 in_channels = self.in_channels_list[0],

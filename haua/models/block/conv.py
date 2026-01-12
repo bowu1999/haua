@@ -22,7 +22,7 @@ def auto_padding(
         computed = tuple((((k - 1) * dilation + 1) // 2) for k in kernel_sizes)
         return computed[0] if len(computed) == 1 else computed
 
-    return padding
+    return padding # type: ignore
 
 
 def _get_act(act: Optional[Union[str, bool, nn.Module]] = "silu") -> Callable[[], nn.Module]:
@@ -53,10 +53,10 @@ def fuse_conv_bn(conv: nn.Conv2d, bn: nn.BatchNorm2d) -> nn.Conv2d:
     fused_conv = nn.Conv2d(
         in_channels=conv.in_channels,
         out_channels=conv.out_channels,
-        kernel_size=conv.kernel_size,
-        stride=conv.stride,
-        padding=conv.padding,
-        dilation=conv.dilation,
+        kernel_size=conv.kernel_size, # type: ignore
+        stride=conv.stride, # type: ignore
+        padding=conv.padding, # type: ignore
+        dilation=conv.dilation, # type: ignore
         groups=conv.groups,
         bias=True,
         device=conv.weight.device,
@@ -66,9 +66,9 @@ def fuse_conv_bn(conv: nn.Conv2d, bn: nn.BatchNorm2d) -> nn.Conv2d:
     bn_running_mean = bn.running_mean
     bn_running_var = bn.running_var
     bn_eps = bn.eps
-    scale = bn_weight / torch.sqrt(bn_running_var + bn_eps)
+    scale = bn_weight / torch.sqrt(bn_running_var + bn_eps) # type: ignore
     fused_conv.weight.data = conv.weight.data * scale.reshape((-1, 1, 1, 1))
-    fused_conv.bias.data = bn_bias - bn_running_mean * scale
+    fused_conv.bias.data = bn_bias - bn_running_mean * scale # type: ignore
 
     return fused_conv
 
@@ -95,7 +95,7 @@ class ConvBNAct(nn.Module):
             out_channels=out_channels,
             kernel_size=kernel_size,
             stride=stride,
-            padding=auto_padding(kernel_size, padding, dilation),
+            padding=auto_padding(kernel_size, padding, dilation), # type: ignore
             dilation=dilation,
             groups=groups,
             bias=False)
@@ -815,3 +815,18 @@ class C2PSA(nn.Module):
         y[0] = self.module_list(y[0])
 
         return self.cv2(torch.cat(y, 1))
+
+
+class UpsampleModule(nn.Module):
+    def __init__(self, in_channels, out_channels, mode='transpose'):
+        super(UpsampleModule, self).__init__()
+        self.mode = mode
+        if mode == 'transpose':
+            self.up = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=2, stride=2)
+        else:
+            self.up = nn.Sequential(
+                nn.Upsample(mode='bilinear', scale_factor=2, align_corners=True),
+                nn.Conv2d(in_channels, out_channels, kernel_size=1))
+
+    def forward(self, x):
+        return self.up(x)

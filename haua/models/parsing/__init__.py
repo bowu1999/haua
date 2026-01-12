@@ -1,1 +1,1 @@
-from .yolo import YOLODecoder, YoloResult
+from .yolo import YOLODecoder, YoloSegDecoder, YoloResult, YoloSegResult

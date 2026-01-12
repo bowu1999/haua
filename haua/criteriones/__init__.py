@@ -2,4 +2,6 @@ from .iou import *
 from .dfl import *
 from .cls import *
 from .assigner import *
-from .yolo import YOLOv8Loss, YOLOv10Loss
+from .seg import *
+
+from .yolo import YOLOv8Loss, YOLOv10Loss, YOLOv11SegLoss

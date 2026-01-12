@@ -1,10 +1,10 @@
-
 max_epochs=300
 
-model = dict(type='TrainYOLO11',
+model = dict(type='TrainYOLO11Seg',
     backbone_config=dict(
-        model_type = "m",
-        num_classes = 80),
+        model_type = "n",
+        num_classes = 80,
+        freeze_layers = True),
     loss_config=dict(
         strides = [8, 16, 32],
         num_classes = 80,
@@ -20,14 +20,15 @@ model = dict(type='TrainYOLO11',
         debug = False,
         o2m_weight = 0.8,
         pos_cls_weight = 1.0,
-        neg_cls_weight = 0.1))
+        neg_cls_weight = 0.1,
+        loss_seg_weight = 1.0))
 
 work_dir = (
     "/lpai/volumes/vc-profile-bd-ga/others/wubo/Projects/Code/hauaworkspace"
-    "/yolo11m")
+    "/yolo11segn")
 
 train_dataloader = dict(
-    dataset=dict(type='YOLOCOCO',
+    dataset=dict(type='YOLOCOCOSeg',
         root = (
             "/lpai/volumes/vc-profile-bd-ga/others/wubo/Datasets/OpenDataLab___COCO_2017/raw/Images"
             "/train2017"),
@@ -35,8 +36,8 @@ train_dataloader = dict(
             "/lpai/volumes/vc-profile-bd-ga/others/wubo/Datasets/OpenDataLab___COCO_2017/raw"
             "/Annotations/instances_train2017.json")),
     sampler=dict(type='DefaultSampler', shuffle=True),
-    collate_fn=dict(type='coco_collate'),
-    batch_size=64,
+    collate_fn=dict(type='coco_seg_collate'),
+    batch_size=16,
     drop_last=True,
     pin_memory=True,
     persistent_workers=True,
@@ -70,7 +71,7 @@ param_scheduler = [
 
 
 # val_dataloader = dict(
-#     dataset=dict(type='YOLOCOCO',
+#     dataset=dict(type='YOLOCOCOSeg',
 #         root = (
         #     "/lpai/volumes/vc-profile-bd-ga/others/wubo/Datasets/OpenDataLab___COCO_2017/raw/Images"
         #     "/val2017"),
@@ -104,6 +105,6 @@ env_cfg = dict(
 
 log_level = 'INFO'
 
-load_from = None
+load_from = "/mnt/volumes/vc-profile-bd-ga/others/wubo/Projects/Code/hauaworkspace/yolo11segn/epoch_1.pth"
 
 resume = True

@@ -17,6 +17,8 @@ IFS=',' read -r -a array <<< "$GPUS"
 
 nproc_per_node=${#array[@]}
 
+echo "[LOG]: Visible GPU NUMs: $nproc_per_node"
+
 export PYTHONWARNINGS="ignore::DeprecationWarning"
 
 # 使用 torchrun 启动分布式训练

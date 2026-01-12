@@ -1,5 +1,6 @@
 from .datasets import *
 from .models import *
-from .losses import *
+from .criteriones import *
 from .utils import *
 from .evaluate import *
+from .tools import *

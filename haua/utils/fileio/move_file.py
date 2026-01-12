@@ -2,7 +2,7 @@ import shutil
 from pathlib import Path
 
 
-def move_files_recursive_flat(
+def moveFilesRecursiveFlat(
     src_dir,
     dst_dir,
     extensions,
@@ -101,7 +101,7 @@ if __name__ == "__main__":
     #   rename_on_conflict=True  → 默认重命名（解决冲突）
     #   dry_run=True             → 先测试，不真移动（强烈建议首次运行时开启！）
     
-    move_files_recursive_flat(
+    moveFilesRecursiveFlat(
         src_dir=source_directory,
         dst_dir=destination_directory,
         extensions=file_extensions,
