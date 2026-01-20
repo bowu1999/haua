@@ -376,18 +376,20 @@ class YOLOv11SegLoss(YOLOv10Loss):
         cls_loss_type: str = "bce",
         label_smoothing: float = 0.0,
         use_focal: bool = True,
-        focal_alpha = 0.75,
-        focal_gamma = 2.0,
-        debug = False,
+        focal_alpha: float = 0.75,
+        focal_gamma: float = 2.0,
+        debug: bool = False,
         o2m_weight: float = 0.8,
         pos_cls_weight: float = 1.0,
         neg_cls_weight: float = 0.1,
         loss_seg_weight: float = 1.0,
+        seg_debug: bool = False,
     ):
         super().__init__(
-            strides, num_classes, dfl_bins, loss_cls_weight, loss_iou_weight, loss_dfl_weight, 
-            cls_loss_type, label_smoothing, use_focal, focal_alpha, focal_gamma, debug, o2m_weight, 
-            pos_cls_weight, neg_cls_weight)
+            strides, num_classes, dfl_bins, loss_cls_weight, loss_iou_weight, 
+            loss_dfl_weight, cls_loss_type, label_smoothing, use_focal, 
+            focal_alpha, focal_gamma, debug, o2m_weight, pos_cls_weight, neg_cls_weight)
+        
         self.one2one_loss = YOLOv8Loss(
             strides = strides,
             num_classes = num_classes,
@@ -405,37 +407,28 @@ class YOLOv11SegLoss(YOLOv10Loss):
             neg_cls_weight = neg_cls_weight,
             tal_topk = 1,
             return_midvars = True)
+        
         self.seg_loss = InstanceSegLoss(
-            strides = strides,
             num_protos = 32,
             proto_size = (160, 160),
             loss_seg_weight = loss_seg_weight,
-            use_dice = True)
-
+            bce_weight = 1.0,
+            dice_weight = 0.2,
+            eps = 1e-6)
+    
     def forward(self, preds, targs):
-        """
-        Args:
-            preds: {
-                'one2one': [...],
-                'one2many': [...],
-                'seg_out': (P3, P4, P5),    # each (B,32,Hs,Ws)
-                'prototype_mask': proto     # (B,32,160,160)
-            }
-            targs: 同之前 + 'gt_masks'
-        """
         img_h, img_w = targs["img"].shape[-2:]
-        # ---- 检测损失 ----
+        # 检测损失
         o2o_out = self.one2one_loss(preds['one2one'], targs)
         o2m_out = self.one2many_loss(preds['one2many'], targs)
         loss = {}
         for k in ["box", "dfl", "cls"]:
             loss[f'loss_o2o_{k}'] = o2o_out[k] * (1 - self.o2m_weight)
         for k in ["box", "dfl", "cls"]:
-            loss[f'loss_o2o_{k}'] = o2m_out[k] * self.o2m_weight
-        # ---- 实例分割损失（通常用 one2one 的匹配信息）----
+            loss[f'loss_o2m_{k}'] = o2m_out[k] * self.o2m_weight
+        # 分割损失
         fg_mask = o2o_out["fg_mask"]
         matched_gt_inds = o2o_out["matched_gt_inds"]
-        # 如果需要 all_grids / strides 也可从 o2o_out 或 self.strides 获取
         seg_loss = self.seg_loss(
             seg_out = preds["seg_out"],
             prototype_mask = preds["prototype_mask"],
@@ -443,8 +436,7 @@ class YOLOv11SegLoss(YOLOv10Loss):
             matched_gt_inds = matched_gt_inds,
             gt_bboxes = targs["gt_bboxes"],
             gt_masks = targs["gt_masks"],
-            img_shape = (img_h, img_w),
-            grids = None)   # 如需要，用 make_grid 重建或从 o2o_out["all_grids"] 传
+            img_shape = (img_h, img_w))
         loss["loss_seg"] = seg_loss
-
+        
         return loss

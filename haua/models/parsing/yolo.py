@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 
 from ..utils import make_grid
+from ...utils import mask2polygon
 
 
 FIXED_COLOR_LIST = [
@@ -341,18 +342,11 @@ class YoloResult:
 
 class YoloSegDecoder:
     """
-    综合解码检测和分割结果：
-      输入:
-        det_outs: tuple of 3 tensors, each (B, 4*reg_max+cls_num, H, W)
-        seg_outs: tuple of 3 tensors, each (B, C_mask=32, N_i)  其中 N_i = H_i*W_i
-        prototype_mask: (B, C_mask=32, Hp, Wp)
-        original_img_size: (orig_w, orig_h)
-
-      输出:
-        cls_res:   (N,) tensor
-        score_res: (N,) tensor
-        bbox_res:  (N,4) tensor (原图坐标)
-        masks_np:  (N, orig_h, orig_w) numpy float32 in [0,1]
+    YOLOv11 实例分割解码器 (优化版)
+    包含:
+    1. 目标检测解码 (调用 det_decoder)
+    2. 实例分割 Mask 生成
+    3. Mask 还原与 BBox 裁剪 (关键步骤)
     """
 
     def __init__(
@@ -367,7 +361,7 @@ class YoloSegDecoder:
         mask_channels=32,
         proto_size=(160, 160),
     ):
-        # 内部创建一个 YOLODecoder，用于目标检测解码
+        # 初始化检测解码器
         self.det_decoder = YOLODecoder(
             threshold=threshold,
             strides=list(strides),
@@ -375,8 +369,10 @@ class YoloSegDecoder:
             reg_max=reg_max,
             cls_num=cls_num,
             prob_fn=prob_fn,
-            return_indices=True,  # 要拿到 anchor_idx
-            padding=padding)
+            return_indices=True,  # 必须为 True，用于获取 mask 系数索引
+            padding=padding
+        )
+        
         if isinstance(img_size, int):
             img_size = (img_size, img_size)
         self.img_size = img_size
@@ -384,109 +380,125 @@ class YoloSegDecoder:
         self.proto_h, self.proto_w = proto_size
         self.padding = padding
 
+    @staticmethod
+    def crop_mask(masks: torch.Tensor, boxes: torch.Tensor) -> torch.Tensor:
+        """
+        使用 BBox 裁剪 Mask (矢量化操作)
+        Args:
+            masks: (N, H, W)
+            boxes: (N, 4) xyxy 格式
+        Returns:
+            cropped_masks: (N, H, W)
+        """
+        n, h, w = masks.shape
+        x1, y1, x2, y2 = torch.chunk(boxes[:, :, None], 4, 1)  # x1 shape(n,1,1)
+        
+        # 创建坐标网格 (复用 device 和 dtype)
+        r = torch.arange(w, device=masks.device, dtype=x1.dtype)[None, None, :]  # rows (x)
+        c = torch.arange(h, device=masks.device, dtype=x1.dtype)[None, :, None]  # cols (y)
+        
+        # 生成裁剪掩码: 像素点必须在 bbox 范围内
+        # (r >= x1) & (r < x2) & (c >= y1) & (c < y2)
+        keep = (r >= x1) * (r < x2) * (c >= y1) * (c < y2)
+        
+        return masks * keep
+
     @torch.no_grad()
     def __call__(
         self,
-        det_outs,          # tuple of 3 tensors, each (B, 4*reg_max+cls_num, H, W)
-        seg_outs,          # tuple of 3 tensors, each (B, C_mask, N_i)
-        prototype_mask,    # (B, C_mask, Hp, Wp)
-        original_img_size, # (orig_w, orig_h)
+        det_outs,          
+        seg_outs,          
+        prototype_mask,    
+        original_img_size, 
         batch_idx: int = 0,
     ):
         """
-        只解码 batch 中一张图（batch_idx），返回这一张图的检测 + 实例分割结果。
+        解码单张图片
         """
         device = prototype_mask.device
         orig_w, orig_h = original_img_size
 
-        # YOLODecoder 解析检测
-        cls_res, score_res, bbox_res, anchor_idx_res = self.det_decoder( # type: ignore
-            det_outs, original_img_size)  # cls_res, score_res, bbox_res: 已是原图坐标
+        # 1. 解码检测结果
+        # cls_res: (N,), score_res: (N,), bbox_res: (N, 4) [原图坐标], anchor_idx: (N,)
+        cls_res, score_res, bbox_res, anchor_idx_res = self.det_decoder(
+            det_outs, original_img_size
+        )
 
-        # 如果 batch_size > 1，YOLODecoder 当前实现是把 B,N_tot flatten 在一起，
-        # anchor_idx_res 是全局索引。此处假设 B=1 的推理场景，使用起来最简单。
-        # 如果将来需要真正 batch 多图推理，建议在 YOLODecoder 中按 batch 分别处理。
+        # 如果没有检测到目标，直接返回空
+        if len(bbox_res) == 0:
+            return cls_res, score_res, bbox_res, np.empty((0, orig_h, orig_w), dtype=np.float32)
 
-        # 将 seg_outs 拼成 (B, C_mask, N_tot)
-        # seg_outs: (P3,P4,P5) each (B,C,N_i)
-        seg_list = []
-        for p in seg_outs:
-            assert p.dim() == 3 and p.shape[1] == self.mask_channels, \
-                f"seg_out 的形状应为 (B,{self.mask_channels},N_i)，当前为 {p.shape}"
-            seg_list.append(p)
-        seg_all = torch.cat(seg_list, dim=2)  # (B, C_mask, N_tot)
+        # 2. 准备 Mask 系数
+        # 将 seg_outs (P3, P4, P5) 拼接 -> (B, 32, N_tot)
+        seg_flat = torch.cat([p.flatten(2) for p in seg_outs], dim=2)[batch_idx] # (32, N_tot)
+        
+        # 根据 anchor 索引提取对应的 mask 系数
+        # anchor_idx_res 是检测框对应的 anchor 索引
+        coeffs = seg_flat[:, anchor_idx_res].T  # (N_det, 32)
 
-        # 取出该 batch 的 seg_flat: (C_mask, N_tot)
-        seg_flat = seg_all[batch_idx]         # (C_mask, N_tot)
-        C_mask, N_tot = seg_flat.shape
-        assert C_mask == self.mask_channels
+        # 3. 生成原型 Mask (Matrix Multiplication)
+        # coeffs: (N, 32) @ proto: (32, 160*160) -> (N, 160*160)
+        proto = prototype_mask[batch_idx].view(self.mask_channels, -1) # (32, 25600)
+        masks = (coeffs @ proto).sigmoid().view(-1, self.proto_h, self.proto_w) # (N, 160, 160)
 
-        # 根据 anchor_idx_res 为每个检测框取 coeff: (N_det, C_mask)
-        anchor_idx_res = anchor_idx_res.to(device)
-        coeffs = seg_flat[:, anchor_idx_res]  # (C_mask, N_det)
-        coeffs = coeffs.permute(1, 0)         # (N_det, C_mask)
-
-        # 用 prototype_mask 生成 proto 尺度实例 mask
-        proto = prototype_mask[batch_idx]     # (C_mask, Hp, Wp)
-        Hp, Wp = proto.shape[1], proto.shape[2]
-        N_det = coeffs.shape[0]
-
-        coeffs = coeffs.view(N_det, C_mask, 1, 1)          # (N_det,C,1,1)
-        proto_exp = proto.unsqueeze(0).expand(N_det, -1, -1, -1)  # (N_det,C,Hp,Wp)
-        masks_proto = (coeffs * proto_exp).sum(dim=1)      # (N_det,Hp,Wp)
-        masks_proto = masks_proto.sigmoid()
-
-        # 将 mask 从 proto 尺度 resize 到网络输入尺寸 (例如 640x640)
+        # 4. 上采样到网络输入尺寸 (例如 640x640)
         masks_in = F.interpolate(
-            masks_proto.unsqueeze(1),         # (N_det,1,Hp,Wp)
+            masks.unsqueeze(1),
             size=self.img_size,
             mode="bilinear",
-            align_corners=False).squeeze(1)   # (N_det, H_in, W_in)
+            align_corners=False
+        ).squeeze(1) # (N, 640, 640)
 
-        # 7. 反 letterbox，映射回原图尺寸
+        # 5. 还原到原图尺寸 (Reverse Letterbox)
         if self.padding:
             in_w, in_h = self.img_size
-            img_w, img_h = orig_w, orig_h
-            scale = min(in_w / img_w, in_h / img_h)
-            new_w = img_w * scale
-            new_h = img_h * scale
-            pad_w = in_w - new_w
-            pad_h = in_h - new_h
-            pad_left = pad_w / 2
-            pad_top = pad_h / 2
-
-            x0 = int(round(pad_left))
-            y0 = int(round(pad_top))
-            x1_pad = int(round(pad_left + new_w))
-            y1_pad = int(round(pad_top + new_h))
-
-            masks_cropped = masks_in[:, y0:y1_pad, x0:x1_pad]  # (N_det, new_h, new_w)
-
+            scale = min(in_w / orig_w, in_h / orig_h)
+            
+            # 计算 padding 区域
+            pad_w = (in_w - orig_w * scale) / 2
+            pad_h = (in_h - orig_h * scale) / 2
+            
+            # 裁剪掉 padding 部分
+            # 注意：这里使用 round 确保和预处理对齐
+            x_start = int(round(pad_w))
+            y_start = int(round(pad_h))
+            x_end = int(round(in_w - pad_w))
+            y_end = int(round(in_h - pad_h))
+            
+            masks_cropped = masks_in[:, y_start:y_end, x_start:x_end]
+            
+            # Resize 到原图大小
             masks_img = F.interpolate(
                 masks_cropped.unsqueeze(1),
                 size=(orig_h, orig_w),
                 mode="bilinear",
-                align_corners=False).squeeze(1)  # (N_det, orig_h, orig_w)
+                align_corners=False
+            ).squeeze(1)
         else:
-            # 如果输入就等于原图尺寸而无 padding，则直接 resize
             masks_img = F.interpolate(
                 masks_in.unsqueeze(1),
                 size=(orig_h, orig_w),
                 mode="bilinear",
-                align_corners=False).squeeze(1)  # (N_det, orig_h, orig_w)
+                align_corners=False
+            ).squeeze(1)
 
+        # 6. [关键步骤] 使用预测的 BBox 裁剪 Mask
+        # bbox_res 已经是原图坐标，masks_img 也是原图尺寸，直接裁剪
+        masks_img = self.crop_mask(masks_img, bbox_res)
+
+        # 7. 转 Numpy 并二值化/截断
         masks_np = masks_img.cpu().numpy().astype(np.float32)
-        masks_np = np.clip(masks_np, 0.0, 1.0)
-
+        # 通常这里不需要 clip，因为 sigmoid 已经在 0-1 之间，但为了保险保留
+        # 如果需要二值化 mask (0 或 1)，可以在这里做: masks_np = (masks_np > 0.5).astype(np.float32)
+        
         return cls_res, score_res, bbox_res, masks_np
 
 
 class YoloSegResult(YoloResult):
     """
     在 YoloResult 的基础上，增加实例分割结果的可视化：
-    - masks: (N, H, W) 或 list[np.ndarray(H, W)]，与 cls_res/bbox_res 对应
-    - show_masks: 是否显示 mask
-    - mask_alpha: mask 叠加透明度
+    - masks: (N, H, W) 与 cls_res/bbox_res 严格对应
+    - 支持 mask, polygon, bbox 的显示控制
     """
 
     def __init__(
@@ -499,163 +511,211 @@ class YoloSegResult(YoloResult):
         masks: Optional[Union[np.ndarray, torch.Tensor, Sequence[np.ndarray]]] = None,
         conf_threshold: float = 0.0,
         target_classes: Optional[Sequence[int]] = None,
-        show_masks: bool = True,
+        show_bbox: bool = True,     # 新增：是否显示检测框
+        show_masks: bool = True,    # 是否显示分割掩码
+        show_polygon: bool = False, # 新增：是否显示多边形轮廓
         mask_alpha: float = 0.4,
         color_list: Optional[Sequence[Tuple[int, int, int]]] = None,
     ):
-        # 先调用父类构造，完成基础检测结果处理与过滤
+        # -------------------------------------------------------
+        # 1. 数据预处理与同步筛选 (核心修复部分)
+        # -------------------------------------------------------
+        
+        # 统一转为 numpy 以便处理
+        if isinstance(cls_res, torch.Tensor): cls_res = cls_res.cpu().numpy()
+        if isinstance(score_res, torch.Tensor): score_res = score_res.cpu().numpy()
+        if isinstance(bbox_res, torch.Tensor): bbox_res = bbox_res.cpu().numpy()
+        
+        # 处理 masks 转 numpy
+        masks_np = None
+        if masks is not None:
+            if isinstance(masks, torch.Tensor):
+                masks_np = masks.detach().cpu().numpy()
+            elif isinstance(masks, np.ndarray):
+                masks_np = masks
+            else:
+                masks_np = np.stack(masks, axis=0)
+            
+            # 维度检查
+            if masks_np.ndim == 4 and masks_np.shape[1] == 1:
+                masks_np = masks_np[:, 0]
+            
+            # 归一化
+            if masks_np.dtype != np.float32:
+                masks_np = masks_np.astype(np.float32)
+            if masks_np.max() > 1.0:
+                masks_np = masks_np / 255.0
+
+        # --- 生成筛选掩码 (Keep Mask) ---
+        # 逻辑：同时满足 置信度阈值 和 目标类别
+        keep_idxs = score_res >= conf_threshold
+        
+        if target_classes is not None:
+            # 检查类别是否在目标列表中
+            class_keep = np.isin(cls_res, target_classes)
+            keep_idxs = keep_idxs & class_keep
+
+        # --- 应用筛选到所有数据 ---
+        # 这样 bbox, score, cls, masks 就永远保持一一对应了
+        self.cls_res_filtered = cls_res[keep_idxs]
+        self.score_res_filtered = score_res[keep_idxs]
+        self.bbox_res_filtered = bbox_res[keep_idxs]
+        
+        if masks_np is not None:
+            # 关键修复：使用相同的索引筛选 mask
+            if len(masks_np) != len(score_res):
+                 # 如果原始输入长度就不对，打印警告或报错
+                 print(f"Warning: Input masks length {len(masks_np)} != scores length {len(score_res)}")
+                 # 尝试截断或报错，这里假设输入是对应的
+                 min_len = min(len(masks_np), len(keep_idxs))
+                 self.masks = masks_np[:min_len][keep_idxs[:min_len]]
+            else:
+                self.masks = masks_np[keep_idxs]
+        else:
+            self.masks = None
+
+        # -------------------------------------------------------
+        # 2. 调用父类初始化
+        # -------------------------------------------------------
+        # 注意：因为我们已经手动筛选过了，传给父类的 conf_threshold 可以设为 0
+        # 或者保持原样（再次筛选也不会有副作用，因为数据已经满足条件）
         super().__init__(
             image=image,
-            cls_res=cls_res,
-            score_res=score_res,
-            bbox_res=bbox_res,
+            cls_res=self.cls_res_filtered,
+            score_res=self.score_res_filtered,
+            bbox_res=self.bbox_res_filtered,
             class_names=class_names,
-            conf_threshold=conf_threshold,
-            target_classes=target_classes,
-            color_list=color_list)
+            conf_threshold=0.0, # 已在外部筛选，这里设为0避免重复逻辑干扰
+            target_classes=None, # 已在外部筛选
+            color_list=color_list
+        )
 
+        # -------------------------------------------------------
+        # 3. 保存可视化配置
+        # -------------------------------------------------------
+        self.show_bbox_flag = show_bbox
         self.show_masks_flag = show_masks
+        self.show_polygon_flag = show_polygon
         self.mask_alpha = mask_alpha
 
-        # 处理 masks
-        self.masks = None  # (N, H, W) float32 [0,1] or None
-
-        if masks is not None:
-            self._set_masks(masks)
-
-        # 重要：需要和过滤后的检测结果对齐
-        # 上面父类在 __init__ 里已经做了过滤，所以这里要根据过滤后的索引再同步 mask
-        # 简单起见，在 _set_masks 里根据最终 self.cls_res 长度直接截断/对齐
-
-    def _set_masks(
-        self,
-        masks: Union[np.ndarray, torch.Tensor, Sequence[np.ndarray]],
-    ):
-        """
-        将外部传入的 masks 转为 (N, H, W) 的 numpy float32 数组，与当前 cls_res/bbox_res 对齐。
-        假设：
-        - 原 masks 的顺序与传入给 YoloSegResult 的 cls_res/score_res/bbox_res 顺序一致；
-        - 过滤后（conf / target_classes），我们只保留前 len(self.cls_res) 个。
-        """
-        # 转 numpy
-        if isinstance(masks, torch.Tensor):
-            masks_np = masks.detach().cpu().numpy()
-        elif isinstance(masks, np.ndarray):
-            masks_np = masks
-        else:
-            # list of np.ndarray
-            masks_np = np.stack(masks, axis=0)
-
-        # 保证是 (N, H, W)
-        if masks_np.ndim == 4 and masks_np.shape[1] == 1:
-            masks_np = masks_np[:, 0]
-        assert masks_np.ndim == 3, f"masks shape 应为 (N,H,W)，当前为 {masks_np.shape}"
-
-        # 根据当前过滤后的检测数量裁剪
-        N_keep = len(self.cls_res)
-        if masks_np.shape[0] < N_keep:
-            # 理论上不应出现；出现说明输入不匹配
-            raise ValueError(
-                f"masks 数量 ({masks_np.shape[0]}) 小于检测数量 ({N_keep})")
-        masks_np = masks_np[:N_keep]
-
-        # 归一化到 [0,1]，以防输入为 0/255
-        if masks_np.dtype != np.float32:
-            masks_np = masks_np.astype(np.float32)
-        if masks_np.max() > 1.0:
-            masks_np = masks_np / 255.0
-
-        self.masks = masks_np  # (N,H,W)
-
     def _draw_masks(self, img_draw):
-        """
-        在 img_draw 上叠加实例 mask（不是必须，需要 show_masks_flag=True）
-        """
-        if self.masks is None or not self.show_masks_flag:
+        """绘制半透明 Mask"""
+        if self.masks is None:
             return img_draw
 
         h_img, w_img = img_draw.shape[:2]
-        N, Hm, Wm = self.masks.shape
-
-        # 如果 mask 尺寸和图像不一致，resize
-        if (Hm, Wm) != (h_img, w_img):
-            # 逐个 resize
+        
+        # Resize masks if needed
+        if (self.masks.shape[1], self.masks.shape[2]) != (h_img, w_img):
             resized_masks = []
             for m in self.masks:
                 m_resized = cv2.resize(m, (w_img, h_img), interpolation=cv2.INTER_LINEAR)
                 resized_masks.append(m_resized)
-            masks = np.stack(resized_masks, axis=0)
+            masks_to_draw = np.stack(resized_masks, axis=0)
         else:
-            masks = self.masks
+            masks_to_draw = self.masks
 
-        # 叠加
         overlay = img_draw.copy()
-        for idx, (cls_id, m) in enumerate(zip(self.cls_res, masks)):
+        
+        for idx, (cls_id, m) in enumerate(zip(self.cls_res, masks_to_draw)):
             cls_id = int(cls_id)
             color = np.array(self._cls_color(cls_id), dtype=np.float32)
 
-            # 创建 3 通道 mask
-            m3 = np.expand_dims(m, axis=-1)  # (H,W,1)
-            # 只在 mask > 0.5 的区域着色
+            m3 = np.expand_dims(m, axis=-1)
             mask_bin = (m3 > 0.5).astype(np.float32)
 
             overlay = overlay.astype(np.float32)
+            # 混合公式
             overlay = (
-                overlay * (1 - mask_bin * self.mask_alpha) + color * (mask_bin * self.mask_alpha))
+                overlay * (1 - mask_bin * self.mask_alpha) + 
+                color * (mask_bin * self.mask_alpha)
+            )
 
-        overlay = np.clip(overlay, 0, 255).astype(np.uint8)
-        return overlay
+        return np.clip(overlay, 0, 255).astype(np.uint8)
+
+    def _draw_polygons(self, img_draw):
+        """绘制多边形轮廓"""
+        if self.masks is None:
+            return img_draw
+            
+        h_img, w_img = img_draw.shape[:2]
+        
+        for idx, (cls_id, m) in enumerate(zip(self.cls_res, self.masks)):
+            # Resize mask to image size for correct polygon coordinates
+            if (m.shape[0], m.shape[1]) != (h_img, w_img):
+                m = cv2.resize(m, (w_img, h_img), interpolation=cv2.INTER_NEAREST)
+            
+            # 获取轮廓
+            contours = mask2polygon(m)
+            
+            cls_id = int(cls_id)
+            color = self._cls_color(cls_id) # tuple (B, G, R)
+            
+            # 绘制轮廓
+            cv2.drawContours(img_draw, contours, -1, color, 2) # thickness=2
+            
+        return img_draw
 
     @property
     def show(self):
         """
-        覆盖父类 show：在绘制 bbox 的同时，按需绘制 mask。
+        可视化入口
         """
         def _show(figsize=(12, 8), title="YOLO Detection + Segmentation"):
             img_draw = self.image.copy() # type: ignore
 
-            # 先画 mask（在原图上），再画 bbox
-            img_draw = self._draw_masks(img_draw)
+            # 1. 绘制 Mask (填充)
+            if self.show_masks_flag:
+                img_draw = self._draw_masks(img_draw)
 
-            # 再画 bbox 和 label
-            for cls_id, score, (x1, y1, x2, y2) in zip(
-                self.cls_res, self.score_res, self.bbox_res
-            ):
-                cls_id = int(cls_id)
-                label = (
-                    self.class_names[cls_id]
-                    if cls_id < len(self.class_names)
-                    else f"class{cls_id}")
-                text = f"{label} {score:.2f}"
+            # 2. 绘制 Polygon (轮廓)
+            if self.show_polygon_flag:
+                img_draw = self._draw_polygons(img_draw)
 
-                color = self._cls_color(cls_id)
+            # 3. 绘制 BBox 和 Label
+            if self.show_bbox_flag:
+                for cls_id, score, (x1, y1, x2, y2) in zip(
+                    self.cls_res, self.score_res, self.bbox_res
+                ):
+                    cls_id = int(cls_id)
+                    color = self._cls_color(cls_id)
+                    
+                    # 画框
+                    cv2.rectangle(
+                        img_draw,
+                        (int(x1), int(y1)),
+                        (int(x2), int(y2)),
+                        color,
+                        2,)
 
-                cv2.rectangle(
-                    img_draw,
-                    (int(x1), int(y1)),
-                    (int(x2), int(y2)),
-                    color,
-                    2,)
+                    # 画标签背景和文字
+                    label = (
+                        self.class_names[cls_id]
+                        if cls_id < len(self.class_names)
+                        else f"class{cls_id}")
+                    text = f"{label} {score:.2f}"
 
-                (w, h), _ = cv2.getTextSize(
-                    text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
-                cv2.rectangle(
-                    img_draw,
-                    (int(x1), int(y1) - 20),
-                    (int(x1) + w, int(y1)),
-                    color,
-                    -1,)
+                    (w, h), _ = cv2.getTextSize(
+                        text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
+                    
+                    cv2.rectangle(
+                        img_draw,
+                        (int(x1), int(y1) - 20),
+                        (int(x1) + w, int(y1)),
+                        color,
+                        -1,)
 
-                cv2.putText(
-                    img_draw,
-                    text,
-                    (int(x1), int(y1) - 5),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    (0, 0, 0),
-                    1,
-                    cv2.LINE_AA,)
+                    cv2.putText(
+                        img_draw,
+                        text,
+                        (int(x1), int(y1) - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (0, 0, 0), # 黑色文字
+                        1,
+                        cv2.LINE_AA,)
 
+            # 显示
             img_rgb = cv2.cvtColor(img_draw, cv2.COLOR_BGR2RGB)
             plt.figure(figsize=figsize)
             plt.imshow(img_rgb)

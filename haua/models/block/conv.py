@@ -1,7 +1,6 @@
 from typing import List, Optional, Tuple, Union, Optional, Callable
 
 import math
-
 import numpy as np
 
 import torch

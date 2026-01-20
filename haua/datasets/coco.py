@@ -46,233 +46,51 @@ coco80_names = [
     "teddy bear", "hair drier", "toothbrush"]
 
 
+def coco_segmentation_to_mask(segmentation, height: int, width: int) -> Optional[np.ndarray]:
+    """
+    将 COCO 的 segmentation (polygon / RLE) 转为 binary mask (H, W)
+    返回 np.ndarray[uint8]，无效 segmentation 返回 None
+    """
+    if segmentation is None:
+        return None
+
+    # Polygon 格式 (List)
+    if isinstance(segmentation, list):
+        if len(segmentation) == 0:
+            return None
+        # 将 polygon 转为 RLE 列表
+        rles = mask_utils.frPyObjects(segmentation, height, width)
+        # 将多个 polygon 片段合并为一个 RLE
+        rle = mask_utils.merge(rles)
+
+    # RLE 格式 (Dict)
+    elif isinstance(segmentation, dict):
+        # 关键修复：
+        # COCO JSON 中的 RLE counts 可能是 list (未压缩)。
+        # decode() 需要 bytes (压缩)。
+        # frPyObjects 能自动处理 list -> bytes 的转换。
+        rle = mask_utils.frPyObjects(segmentation, height, width)
+
+    else:
+        return None
+
+    # Decode RLE -> Binary Mask
+    mask = mask_utils.decode(rle)  # (H, W) or (H, W, 1)
+    
+    # 处理维度，确保返回 (H, W)
+    if len(mask.shape) == 3:
+        mask = mask[:, :, 0]
+
+    return mask.astype(np.uint8)
+
+
 def xywh2xyxy(boxes: np.ndarray) -> np.ndarray:
     """COCO 的 bbox 是 [x, y, w, h] -> 转为 [x1, y1, x2, y2]"""
     boxes = boxes.copy().astype(np.float32)
     boxes[:, 2] = boxes[:, 0] + boxes[:, 2]
     boxes[:, 3] = boxes[:, 1] + boxes[:, 3]
+
     return boxes
-
-
-def clip_boxes(boxes: np.ndarray, width: int, height: int) -> np.ndarray:
-    boxes[:, 0] = np.clip(boxes[:, 0], 0, width - 1)
-    boxes[:, 1] = np.clip(boxes[:, 1], 0, height - 1)
-    boxes[:, 2] = np.clip(boxes[:, 2], 0, width - 1)
-    boxes[:, 3] = np.clip(boxes[:, 3], 0, height - 1)
-    return boxes
-
-
-class ToTensor:
-    def __call__(self, image, target):
-        # image: PIL -> Tensor [C,H,W] 0-1
-        image = F.to_tensor(image)
-        return image, target
-
-
-class Normalize:
-    def __init__(self, mean, std):
-        self.mean = mean
-        self.std = std
-
-    def __call__(self, image: Tensor, target):
-        image = F.normalize(image, mean=self.mean, std=self.std)
-        return image, target
-
-
-class Compose:
-    def __init__(self, transforms: List[Callable]):
-        self.transforms = transforms
-
-    def __call__(self, image, target):
-        for t in self.transforms:
-            res = t(image, target)
-            if isinstance(res, (tuple, list)):
-                if len(res) == 2:
-                    image, target = res
-                elif len(res) == 1:
-                    image = res[0]
-                else:
-                    raise RuntimeError(f"Transform {t} returned unexpected tuple length {len(res)}")
-            else:
-                image = res
-        return image, target
-
-
-class InferCompose:
-    def __init__(self, transforms: List[Callable]):
-        self.transforms = transforms
-
-    def __call__(self, image, target=None):
-        was_none = target is None
-        if was_none:
-            target = {}
-        for t in self.transforms:
-            res = t(image, target)
-            if isinstance(res, (tuple, list)):
-                if len(res) == 2:
-                    image, target = res
-                elif len(res) == 1:
-                    image = res[0]
-                else:
-                    raise RuntimeError(f"Transform {t} returned unexpected tuple length {len(res)}")
-            else:
-                image = res
-        if was_none:
-            return image
-        return image, target
-
-
-class ImageOnlyWrapper:
-    def __init__(self, fn: Callable):
-        self.fn = fn
-
-    def __call__(self, image, target=None):
-        out = self.fn(image)
-        if isinstance(out, (tuple, list)):
-            image = out[0]
-        else:
-            image = out
-        return image, target
-    
-
-class LetterBox:
-    """
-    调整图片大小并填充至目标图片尺寸，同时保持宽高比
-
-    Args:
-        img_size: int or (h, w). if int -> square (img_size, img_size)
-        stride: int padding divisible by stride (通常为模型最大 stride，如 32)
-        auto: 如果为真，则使填充形状可被步长整除（最小填充）
-        scaleup: 允许放大小图像
-        color: pad color (0-255) or tuple (R,G,B)
-
-    Returns PIL.Image 和 更新目标（调整目标框）
-    """
-    def __init__(self, img_size=640, stride=32, auto=True, scaleup=True, color=114):
-        if isinstance(img_size, int):
-            self.img_size = (img_size, img_size)
-        else:
-            self.img_size = img_size
-        self.stride = stride
-        self.auto = auto
-        self.scaleup = scaleup
-        if isinstance(color, int):
-            self.color = (color, color, color)
-        else:
-            self.color = color
-
-    def __call__(self, image: Image.Image, target: Optional[Dict[str, Tensor]] = None):
-        orig_w, orig_h = image.size  # PIL: (w, h)
-        target_h, target_w = self.img_size[0], self.img_size[1]
-        # compute scale to fit in target while preserving aspect ratio
-        r = min(target_w / orig_w, target_h / orig_h)
-        if not self.scaleup:
-            r = min(r, 1.0)
-        new_w = int(round(orig_w * r))
-        new_h = int(round(orig_h * r))
-        # resize
-        if (orig_w, orig_h) != (new_w, new_h):
-            image = image.resize((new_w, new_h), resample=Image.BILINEAR) # type: ignore
-        # compute padding
-        pad_w = target_w - new_w
-        pad_h = target_h - new_h
-        # if auto: make padding divisible by stride
-        if self.auto and self.stride:
-            pad_w_mod = pad_w % self.stride
-            pad_h_mod = pad_h % self.stride
-            if pad_w_mod != 0:
-                pad_w += (self.stride - pad_w_mod)
-            if pad_h_mod != 0:
-                pad_h += (self.stride - pad_h_mod)
-        pad_left = pad_w // 2
-        pad_top = pad_h // 2
-        pad_right = pad_w - pad_left
-        pad_bottom = pad_h - pad_top
-        if any([pad_left, pad_top, pad_right, pad_bottom]):
-            image = ImageOps.expand(
-                image, border=(pad_left, pad_top, pad_right, pad_bottom), fill=self.color)
-
-        # 如果没有 target（推理流程），直接返回 image
-        if target is None:
-            return image, None
-
-        # update boxes in target (if present)
-        if 'boxes' in target and len(target['boxes']) > 0:
-            boxes = target['boxes'].numpy().astype(np.float32)  # [N,4] x1,y1,x2,y2
-            # scale coordinates then shift by pad
-            boxes = boxes * r
-            boxes[:, [0, 2]] += pad_left  # x coords
-            boxes[:, [1, 3]] += pad_top   # y coords
-            # clip to new image size
-            boxes[:, 0] = np.clip(boxes[:, 0], 0, target_w - 1)
-            boxes[:, 1] = np.clip(boxes[:, 1], 0, target_h - 1)
-            boxes[:, 2] = np.clip(boxes[:, 2], 0, target_w - 1)
-            boxes[:, 3] = np.clip(boxes[:, 3], 0, target_h - 1)
-            target['boxes'] = torch.as_tensor(boxes, dtype=torch.float32)
-            # update area if exists
-            if 'area' in target:
-                target['area'] = target['area'] * (r * r)
-
-        return image, target
-
-
-class Resize:
-    """按短边或固定尺寸缩放（保持长宽比），并对 boxes 缩放
-
-    Args:
-        min_size: (int | tuple(ints)): 如果是单个 int，将短边缩放到该尺寸（常用于训练时随机选择）；
-                  如果是 tuple，代表直接将短边随机选取在该区间内。
-        max_size: (int): 缩放后长边不超过 max_size
-    """
-    def __init__(self, min_size: int = 800, max_size: int = 1333):
-        if isinstance(min_size, (list, tuple)):
-            self.min_size = min_size
-        else:
-            self.min_size = (min_size,)
-        self.max_size = max_size
-
-    def get_size(self, image_size: Tuple[int, int]):
-        w, h = image_size
-        min_size = random.choice(self.min_size)
-        min_orig = float(min((w, h)))
-        max_orig = float(max((w, h)))
-        scale = min_size / min_orig
-        if max_orig * scale > self.max_size:
-            scale = self.max_size / max_orig
-        new_w = int(round(w * scale))
-        new_h = int(round(h * scale))
-        return new_w, new_h, scale
-
-    def __call__(self, image: Image.Image, target: Optional[Dict[str, Tensor]] = None):
-        orig_w, orig_h = image.size
-        new_w, new_h, scale = self.get_size((orig_w, orig_h))
-        image = image.resize((new_w, new_h), resample=Image.BILINEAR) # type: ignore
-        if target is None:
-            return image, None
-        if 'boxes' in target:
-            boxes = target['boxes'].numpy()
-            boxes = boxes * scale
-            target['boxes'] = torch.as_tensor(boxes, dtype=torch.float32)
-            if 'area' in target:
-                target['area'] = target['area'] * (scale * scale)
-        return image, target
-
-
-class RandomHorizontalFlip:
-    def __init__(self, prob=0.5):
-        self.prob = prob
-
-    def __call__(self, image: Image.Image, target: Optional[Dict[str, Tensor]] = None):
-        if random.random() < self.prob:
-            image = F.hflip(image) # type: ignore
-            w, _ = image.size
-            if target is None:
-                return image, None
-            if 'boxes' in target and len(target['boxes']) > 0:
-                boxes = target['boxes'].numpy()
-                boxes[:, [0, 2]] = w - boxes[:, [2, 0]]
-                target['boxes'] = torch.as_tensor(boxes, dtype=torch.float32)
-        return image, target
 
 
 class COCODetectionDataset(Dataset):
@@ -283,18 +101,8 @@ class COCODetectionDataset(Dataset):
         transforms: Optional[Callable] = None,
         return_masks: bool = False
     ):
-        """
-        Args:
-            root: images 的根目录
-            ann_file: COCO 格式的 annotation json 文件路径
-            transforms: callable(image, target) -> image, target
-            return_masks: 是否在 target 中返回 segmentation masks（list of polygons/bitmasks）
-        """
         if COCO is None:
-            raise RuntimeError("""
-                pycocotools is required to use COCODetectionDataset.
-                Install with 'pip install pycocotools' or 'pip install pycocotools-windows' 
-                depending on platform.""")
+            raise RuntimeError("pycocotools is required. Install with `pip install pycocotools`.")
 
         self.root = Path(root)
         self.coco = COCO(ann_file)
@@ -308,53 +116,79 @@ class COCODetectionDataset(Dataset):
     def __getitem__(self, index: int):
         img_id = self.ids[index]
         img_info = self.coco.loadImgs(img_id)[0]
-        path = img_info['file_name']
-        img_path = self.root / path
+        img_path = self.root / img_info['file_name']
+
         image = Image.open(img_path).convert('RGB')
+        W, H = image.size
+
         ann_ids = self.coco.getAnnIds(imgIds=img_id)
         anns = self.coco.loadAnns(ann_ids)
-        boxes = []
-        labels = []
-        areas = []
-        iscrowd = []
+
+        boxes, labels, areas, iscrowd = [], [], [], []
         masks = []
+
         for ann in anns:
-            # 有些 ann 可能没有 bbox 或者 bbox 无效，需过滤
             if 'bbox' not in ann:
                 continue
+
             x, y, w, h = ann['bbox']
-            if w <= 0 or h <= 0:
+            # 过滤掉无效的小框
+            if w <= 1 or h <= 1:
                 continue
+
             orig_cat = ann['category_id']
-            # 将 COCO 的原始 category_id 映射为 0..79
             if orig_cat not in COCO_ID_TO_80:
-                # 如果注释里出现了未在 80 类表中的 id，跳过该注释
-                # 这种情况常见于 COCO 的 1..91 id 空洞（非用于检测的 id）
                 continue
-            mapped_label = COCO_ID_TO_80[orig_cat]
+
+            # --- 修复核心开始 ---
+            # 1. 如果需要 mask，先尝试解析 mask
+            current_mask = None
+            if self.return_masks:
+                seg = ann.get('segmentation', None)
+                current_mask = coco_segmentation_to_mask(seg, H, W)
+                
+                # 关键修复：如果 mask 无效（None 或 全黑），直接跳过这个物体
+                # 这样就不会出现有 box 没 mask 的情况了
+                if current_mask is None or current_mask.sum() <= 0:
+                    continue
+            
+            # 2. 只有 mask 有效（或不需要 mask）时，才添加 box 和 label
             boxes.append([x, y, x + w, y + h])
-            labels.append(mapped_label)
+            labels.append(COCO_ID_TO_80[orig_cat])
             areas.append(ann.get('area', w * h))
             iscrowd.append(ann.get('iscrowd', 0))
+
             if self.return_masks:
-                masks.append(ann.get('segmentation', None))
+                masks.append(current_mask)
+            # --- 修复核心结束 ---
+
+        # 处理空数据的情况 (防止之前的 IndexError: too many indices)
+        if len(boxes) > 0:
+            boxes_t = torch.as_tensor(boxes, dtype=torch.float32)
+            labels_t = torch.as_tensor(labels, dtype=torch.int64)
+            areas_t = torch.as_tensor(areas, dtype=torch.float32)
+            iscrowd_t = torch.as_tensor(iscrowd, dtype=torch.uint8)
+        else:
+            boxes_t = torch.zeros((0, 4), dtype=torch.float32)
+            labels_t = torch.zeros((0,), dtype=torch.int64)
+            areas_t = torch.zeros((0,), dtype=torch.float32)
+            iscrowd_t = torch.zeros((0,), dtype=torch.uint8)
+
         target = {
-            'boxes': torch.as_tensor(boxes, dtype=torch.float32),
-            'labels': torch.as_tensor(labels, dtype=torch.int64),
+            'boxes': boxes_t,
+            'labels': labels_t,
             'image_id': torch.tensor([img_id]),
-            'area': torch.as_tensor(areas, dtype=torch.float32),
-            'iscrowd': torch.as_tensor(iscrowd, dtype=torch.uint8)}
+            'area': areas_t,
+            'iscrowd': iscrowd_t}
+
         if self.return_masks:
-            target['masks'] = masks # type: ignore
+            if len(masks) > 0:
+                target['masks'] = torch.from_numpy(np.stack(masks, axis=0).astype(np.float32))
+            else:
+                target['masks'] = torch.zeros((0, H, W), dtype=torch.float32)
 
         if self.transforms is not None:
-            try:
-                image, target = self.transforms(image, target)
-            except Exception as e:
-                raise RuntimeError(
-                    f"Error applying transforms for image id {img_id} ({img_path}). "
-                    f"Original error: {e}"
-                ) from e
+            image, target = self.transforms(image, target)
 
         return image, target
 
@@ -381,177 +215,59 @@ def coco_collate(batch):
     return inputs, data_samples
 
 
-def _decode_single_seg(seg, H: int, W: int):
-    """
-    解码单个 COCO segmentation 对象为 (H, W) 的 0/1 numpy 数组。
-    seg 可能是：
-      - polygon: list[list[float]] 或 list[float]
-      - RLE dict: {'size':[H,W], 'counts':...}
-      - list of RLE dict
-    返回:
-      - m: np.ndarray (H, W) uint8{0,1}，若无法解析则返回 None
-    """
-    if seg is None:
-        return None
-    # polygon 或 list of polygon / RLE dict
-    if isinstance(seg, list):
-        if len(seg) == 0:
-            return None
-        # 如果元素是 dict，且有 'counts'，则视为 RLE 列表
-        if isinstance(seg[0], dict) and 'counts' in seg[0]:
-            try:
-                rles = seg
-                rle = mask_utils.merge(rles)
-                m = mask_utils.decode(rle)
-            except Exception:
-                return None
-        else:
-            # 否则视为 polygon 列表（标准 COCO segmentation）
-            try:
-                rles = mask_utils.frPyObjects(seg, H, W)
-                rle = mask_utils.merge(rles)
-                m = mask_utils.decode(rle)
-            except Exception:
-                return None
-    # 单个 RLE dict
-    elif isinstance(seg, dict) and 'counts' in seg and 'size' in seg:
-        try:
-            m = mask_utils.decode(seg)  # type: ignore
-        except Exception:
-            return None
-    else:
-        # 其他不认识的格式
-        return None
-    if m.ndim == 3:
-        m = m[..., 0]
-    return m  # np.ndarray (H, W)
-
-
 def coco_seg_collate(batch):
-    """
-    与 coco_collate 类似，但额外返回实例分割的 gt_masks。
-    返回:
-        inputs: Tensor [B, C, H, W]
-        data_samples: dict
-            - 'gt_bboxes': FloatTensor (B, M_max, 4)，0 填充
-            - 'gt_labels': LongTensor  (B, M_max)，-1 填充
-            - 'gt_masks':  FloatTensor (B, M_max, H, W)，0 填充
-            - 'num_gts':   LongTensor  (B,) 每张图真实实例个数
-    要求 Dataset 构造时 return_masks=True，使得 target['masks'] 为 COCO segmentation 列表。
-    """
     images, targets = zip(*batch)
     inputs = torch.stack(images, dim=0)  # [B,C,H,W]
     batch_size, _, H, W = inputs.shape
-    # 每张图原始的实例数（按 boxes 数量）
+
     num_boxes_per_img = [len(t['boxes']) for t in targets]
     max_num_boxes = max(num_boxes_per_img) if batch_size > 0 else 0
+
     gt_bboxes = torch.zeros((batch_size, max_num_boxes, 4), dtype=torch.float32)
-    gt_labels = -torch.ones((batch_size, max_num_boxes), dtype=torch.int64)  # 使用 -1 填充
-    # masks: (B, M_max, H, W)
-    gt_masks = torch.zeros((batch_size, max_num_boxes, H, W), dtype=torch.float32)
-    num_gts = torch.zeros((batch_size,), dtype=torch.long)
+    gt_labels = -torch.ones((batch_size, max_num_boxes), dtype=torch.int64)
+    gt_masks  = torch.zeros((batch_size, max_num_boxes, H, W), dtype=torch.float32)
+    num_gts   = torch.zeros((batch_size,), dtype=torch.long)
+
     for i, target in enumerate(targets):
-        boxes_i: torch.Tensor = target['boxes']   # (Gi_box, 4)
-        labels_i: torch.Tensor = target['labels'] # (Gi_box,)
-        masks_i = target.get('masks', None)       # list length Gi_box or None
-        if masks_i is None or len(masks_i) == 0 or len(boxes_i) == 0:
-            # 没有实例，保持这一行全 0 / -1
+        boxes_i: torch.Tensor = target['boxes']    # (Gi, 4)
+        labels_i: torch.Tensor = target['labels']  # (Gi,)
+        masks_i: torch.Tensor = target.get('masks', None)  # (Gi, H, W)
+
+        if masks_i is None or len(boxes_i) == 0:
             num_gts[i] = 0
             continue
-        assert len(masks_i) == len(boxes_i), \
-            "boxes 和 masks 数量不一致，请检查 Dataset.__getitem__"
+
+        assert masks_i.ndim == 3, "target['masks'] 必须是 (N,H,W) bitmask"
+
         filtered_boxes = []
         filtered_labels = []
-        inst_masks: List[torch.Tensor] = []
-        # 对该图的每个实例做一致的过滤：seg decode 失败则该实例整体丢弃
-        for box, label, seg in zip(boxes_i, labels_i, masks_i):
-            m = _decode_single_seg(seg, H, W)
-            if m is None:
-                # segmentation 无法解析，该实例在检测和分割中都不使用
+        filtered_masks = []
+
+        for box, label, mask in zip(boxes_i, labels_i, masks_i):
+            # 如果 mask 全 0，认为是无效实例
+            if mask.sum() <= 0:
                 continue
-            m = torch.from_numpy(m.astype(np.float32))  # (H,W)
-            inst_masks.append(m)
             filtered_boxes.append(box)
             filtered_labels.append(label)
-        Gi_keep = len(inst_masks)
+            filtered_masks.append(mask)
+
+        Gi_keep = len(filtered_masks)
         num_gts[i] = Gi_keep
+
         if Gi_keep == 0:
-            # 这一图所有实例都被丢弃
             continue
-        # 限制不要超过本 batch 的 max_num_boxes（正常不会超过）
+
         Gi_keep = min(Gi_keep, max_num_boxes)
         gt_bboxes[i, :Gi_keep] = torch.stack(filtered_boxes[:Gi_keep], dim=0)
         gt_labels[i, :Gi_keep] = torch.stack(filtered_labels[:Gi_keep], dim=0)
-        gt_masks[i, :Gi_keep] = torch.stack(inst_masks[:Gi_keep], dim=0)  # (Gi_keep, H, W)
+        gt_masks[i,  :Gi_keep] = torch.stack(filtered_masks[:Gi_keep], dim=0)
+
     data_samples = {
         'img': inputs,
-        'gt_bboxes': gt_bboxes,  # (B, M, 4)
-        'gt_labels': gt_labels,  # (B, M)
-        'gt_masks': gt_masks,    # (B, M, H, W)
-        'num_gts': num_gts}      # (B,)
+        'gt_bboxes': gt_bboxes,
+        'gt_labels': gt_labels,
+        'gt_masks': gt_masks,
+        'num_gts': num_gts}
 
     return inputs, data_samples
 
-
-def get_train_transforms(
-    imgsz: int = 640,
-    mean = (0.485, 0.456, 0.406),
-    std = (0.229, 0.224, 0.225),
-    auto = True
-):
-    transforms = Compose([
-        LetterBox(img_size=imgsz, stride=32, auto=auto, scaleup=True, color=114),
-        RandomHorizontalFlip(0.5),
-        ToTensor(),
-        Normalize(mean=mean, std=std)])
-
-    return transforms
-
-def get_val_transforms(
-    imgsz: int = 640,
-    mean = (0.485, 0.456, 0.406),
-    std = (0.229, 0.224, 0.225),
-    auto = True
-):
-    transforms = Compose([
-        LetterBox(img_size=imgsz, stride=32, auto=auto, scaleup=False, color=114),
-        ToTensor(),
-        Normalize(mean=mean, std=std)])
-
-    return transforms
-
-
-def get_infer_transforms(
-    imgsz: int = 640,
-    mean = (0.485, 0.456, 0.406),
-    std = (0.229, 0.224, 0.225),
-    auto = True
-):
-    """
-    推理时使用的 transforms：
-      - LetterBox(scaleup=False) 保持长宽比并 pad 到 imgsz（同 val）
-      - ToTensor
-      - Normalize
-
-    返回的是一个 callable (image, target=None) -> (image_tensor, None)
-    """
-    transforms = InferCompose([
-        LetterBox(img_size=imgsz, stride=32, auto=auto, scaleup=False, color=114),
-        ToTensor(),
-        Normalize(mean=mean, std=std)])
-
-    return transforms
-
-
-def infer_collate(batch):
-    """
-    batch: list of items each returned by dataset.__getitem__:
-        - if dataset.__getitem__ returns (image_tensor, None) -> batch is list of tuples
-    返回:
-        inputs: Tensor [B, C, H, W]
-        meta: list of meta info or None (这里不包含 target)
-    """
-    images = [item[0] if isinstance(item, (list, tuple)) else item for item in batch]
-    inputs = torch.stack(images, dim=0)
-
-    return inputs

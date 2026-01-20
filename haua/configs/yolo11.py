@@ -1,9 +1,10 @@
-
 max_epochs=300
+
+model_type = "x"
 
 model = dict(type='TrainYOLO11',
     backbone_config=dict(
-        model_type = "m",
+        model_type = model_type,
         num_classes = 80),
     loss_config=dict(
         strides = [8, 16, 32],
@@ -24,7 +25,7 @@ model = dict(type='TrainYOLO11',
 
 work_dir = (
     "/lpai/volumes/vc-profile-bd-ga/others/wubo/Projects/Code/hauaworkspace"
-    "/yolo11m")
+    f"/yolo11{model_type}")
 
 train_dataloader = dict(
     dataset=dict(type='YOLOCOCO',
@@ -36,7 +37,7 @@ train_dataloader = dict(
             "/Annotations/instances_train2017.json")),
     sampler=dict(type='DefaultSampler', shuffle=True),
     collate_fn=dict(type='coco_collate'),
-    batch_size=64,
+    batch_size=32,
     drop_last=True,
     pin_memory=True,
     persistent_workers=True,
@@ -51,7 +52,7 @@ train_cfg = dict(
 optim_wrapper = dict(
     optimizer=dict(
         type='AdamW',
-        lr=2e-3,
+        lr=1e-3,
         weight_decay=1e-2))
 
 param_scheduler = [
@@ -106,4 +107,4 @@ log_level = 'INFO'
 
 load_from = None
 
-resume = True
+resume = False

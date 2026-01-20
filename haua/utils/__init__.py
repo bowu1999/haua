@@ -1,4 +1,5 @@
 from .bbox import *
+from .mask import *
 from .image import *
 from .fileio import *
 

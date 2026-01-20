@@ -11,8 +11,16 @@ ImageInput = Union[str, np.ndarray, Image.Image]
 
 def processImage2opencvNumpy(img_input: ImageInput) -> Tuple[np.ndarray, Optional[str]]:
     """
-    将不同类型的输入统一转换为 OpenCV BGR numpy 数组。
-    返回: (image_numpy_bgr, original_filename_if_exists)
+    将不同类型的输入统一转换为 OpenCV BGR numpy 数组
+    
+    Args:
+        img_input: 输入图像，支持以下类型
+            1. 路径字符串（str）：表示图像的文件路径
+            2. OpenCV BGR numpy 数组（numpy.ndarray）：直接返回
+            3. PIL Image 对象（PIL.Image.Image）：转换为 OpenCV BGR numpy 数组后返回
+
+    Returns:
+        (image_numpy_bgr, original_filename_if_exists)
     """
     img = None
     filename = None

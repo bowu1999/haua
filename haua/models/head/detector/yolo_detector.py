@@ -105,4 +105,4 @@ class YOLODetector(nn.Module):
             out = self.heads[i](x)
             outs += (out,)
 
-        return outs
+        return outs # type: ignore

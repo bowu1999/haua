@@ -1,8 +1,6 @@
-from typing import List, Tuple, Optional, Literal, Union, Sequence
-import os
-import cv2
+from typing import List, Tuple, Literal, Union, Sequence
+
 import numpy as np
-from PIL import Image
 import matplotlib.pyplot as plt
 
 import torch

@@ -36,7 +36,7 @@ class YOLOCOCO(COCODetectionDataset):
         super().__init__(
             root = root,
             ann_file = ann_file,
-            transforms = get_train_transforms(640, auto=False),
+            transforms = get_train_transforms(640, mode='letterbox'),
             return_masks = return_masks)
 
 class TrainYOLO11(BaseModel):
