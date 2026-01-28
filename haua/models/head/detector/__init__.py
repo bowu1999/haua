@@ -1,1 +1,2 @@
 from .yolo_detector import DualBranchHead, YOLODetector
+from .rtdertv2 import getContrastiveDenoisingTrainingGroup, RTDETRTransformerv2

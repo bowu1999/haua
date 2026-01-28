@@ -69,7 +69,7 @@ def coco_segmentation_to_mask(segmentation, height: int, width: int) -> Optional
         # COCO JSON 中的 RLE counts 可能是 list (未压缩)。
         # decode() 需要 bytes (压缩)。
         # frPyObjects 能自动处理 list -> bytes 的转换。
-        rle = mask_utils.frPyObjects(segmentation, height, width)
+        rle = mask_utils.frPyObjects(segmentation, height, width) # type: ignore
 
     else:
         return None
@@ -270,4 +270,3 @@ def coco_seg_collate(batch):
         'num_gts': num_gts}
 
     return inputs, data_samples
-

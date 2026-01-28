@@ -2,8 +2,8 @@ from setuptools import setup, find_packages
 
 setup(
     name='haua',
-    version='0.1.0',
-    packages=find_packages(),
+    version='0.1.1',
+    packages=find_packages(include=["haua", "haua.*"]),
     install_requires=[
         'numpy', 
         'pandas',

@@ -169,7 +169,7 @@ class UnifiedResize:
         target_h, target_w = self.target_size
         
         # 1. Resize Image
-        image = F.resize(image, self.target_size, interpolation=F.InterpolationMode.BILINEAR)
+        image = F.resize(image, self.target_size, interpolation=F.InterpolationMode.BILINEAR) # type: ignore
         
         if target is None: return image, target
 
@@ -189,7 +189,7 @@ class UnifiedResize:
         # 3. Resize Masks
         if 'masks' in target and len(target['masks']) > 0:
             target['masks'] = F.resize(
-                target['masks'], self.target_size, interpolation=F.InterpolationMode.NEAREST
+                target['masks'], self.target_size, interpolation=F.InterpolationMode.NEAREST # type: ignore
             )
             
         return image, target
@@ -291,7 +291,7 @@ class RandomHorizontalFlip:
 
     def __call__(self, image: Image.Image, target: Optional[Dict]=None):
         if random.random() < self.prob:
-            image = F.hflip(image)
+            image = F.hflip(image) # type: ignore
             if target is None: return image, target
             
             w, h = image.size
@@ -317,7 +317,7 @@ class ColorJitter:
 
 def get_train_transforms(img_size: int=640, mode='stretch'):
     if isinstance(img_size, int):
-        img_size = (img_size, img_size)
+        img_size = (img_size, img_size) # type: ignore
     else:
         img_size = img_size
 
@@ -331,7 +331,7 @@ def get_train_transforms(img_size: int=640, mode='stretch'):
 
 def get_val_transforms(img_size: int=640, mode='stretch'):
     if isinstance(img_size, int):
-        img_size = (img_size, img_size)
+        img_size = (img_size, img_size) # type: ignore
     else:
         img_size = img_size
 

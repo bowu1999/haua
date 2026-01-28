@@ -1,3 +1,4 @@
 thop
 calflops
 torchinfo
+onnx-simplifier

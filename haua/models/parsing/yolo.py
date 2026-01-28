@@ -44,8 +44,8 @@ class YOLODecoder:
         reg_max: int = 16,
         cls_num: int = 80,
         prob_fn: str = "softmax",
-        padding: bool = True,
-        return_indices: bool = False,   # 新增：是否返回 anchor 索引
+        padding: bool = False,  # <--- 注意：针对你的训练方式，这里建议默认为 False
+        return_indices: bool = False,
     ):
         if isinstance(img_size, tuple):
             self.img_size = img_size
@@ -53,7 +53,6 @@ class YOLODecoder:
             self.img_size = (img_size,) * 2
         else:
             raise TypeError("img_size must be int or tuple")
-
         self.strides = list(strides)
         self.scales = [self.img_size[0] // s for s in self.strides]
         self.threshold = threshold
@@ -66,131 +65,97 @@ class YOLODecoder:
 
     @torch.no_grad()
     def __call__(self, outputs, original_img_size=None):
-        """
-        outputs:
-          - 原始版本支持两种形式：
-            1) 直接是 3 个尺度的 tuple: (P3, P4, P5)，每个形状 (B, C, H, W)
-            2) model 输出是个 tuple，最后一项才是 (P3,P4,P5)，这里通过
-               if isinstance(outputs[-1], tuple): outputs = outputs[-1]
-               自动取出最后一项。
-        """
-        # 保持你原来的兼容逻辑
+        # 兼容性处理
         if isinstance(outputs, (list, tuple)) and len(outputs) > 0 \
             and isinstance(outputs[-1], (list, tuple)):
             outputs = outputs[-1]
-
         assert isinstance(outputs, (list, tuple)) and len(outputs) == len(self.strides), \
-            (
-                f"outputs 必须是长度为 {len(self.strides)} 的 tuple/list，每一项是 (B,C,H,W)"
-                f"当前类型 {type(outputs)}")
-
-        # ==== 以下部分逻辑与原始版本保持一致，只是多记录 anchor 下标 ====
+            f"outputs 长度不匹配"
         all_results = []
         all_grids = []
         all_strides = []
-
+        # 生成 Grid 和 Stride
         for i, p in enumerate(outputs):
-            assert isinstance(p, torch.Tensor) and p.dim() == 4, \
-                f"第{i}个输出必须是 4D tensor (B,C,H,W)，当前 {type(p)}，dim={p.dim()}"
-            B, C, H, W = p.shape # type: ignore
-            assert C == self.channel, \
-                f"第{i}个输出通道数应为 {self.channel}，当前 {C}"
+            B, C, H, W = p.shape
             N = H * W
-
-            # (B,C,H,W) -> (B*H*W, C)
+            # 这里的 grid 生成依赖于特征图大小，如果输入固定为 640，特征图大小也是固定的
+            # 即使原图不是 640，只要 resize 到了 640，这里逻辑就是对的
             all_results.append(p.permute(0, 2, 3, 1).reshape(-1, self.channel))
-
-            # grid 仍按原来的 self.scales 来生成（即 H=W=self.scales[i]）
-            grid = make_grid((self.scales[i],) * 2).view(-1, 2)  # (N_i,2)
+            # 动态生成 grid，防止 shape 对不上
+            grid = self._make_grid(W, H).to(p.device)
             all_grids.append(grid)
-
-            # stride map (N_i,)
             all_strides.append(
                 torch.full((N,), self.strides[i], dtype=torch.float32, device=p.device))
-
-        # 拼接所有尺度
-        all_results = torch.cat(all_results, dim=0)  # (B*N_tot, C)
-        all_grids = torch.cat(all_grids, dim=0)      # (N_tot, 2)
-        all_strides = torch.cat(all_strides, dim=0)  # (N_tot,)
-
-        # 与原来一样拆分 dfl 与 cls
-        dfl_result, cls_result = torch.split(
-            all_results, [4 * self.reg_max, self.cls_num], dim=1
-        )
-
+        all_results = torch.cat(all_results, dim=0)
+        all_grids = torch.cat(all_grids, dim=0)
+        all_strides = torch.cat(all_strides, dim=0)
+        # 拆分 DFL 和 CLS
+        dfl_result, cls_result = torch.split(all_results, [4 * self.reg_max, self.cls_num], dim=1)
         if self.prob_fn == "softmax":
             cls_result = F.softmax(cls_result, dim=1)
         elif self.prob_fn == "sigmoid":
             cls_result = torch.sigmoid(cls_result)
-
-        # 分类得分与标签
-        cls_, indices = torch.max(cls_result, dim=1)  # (B*N_tot,)
-        resindx = cls_ > self.threshold               # (B*N_tot,)
-
-        # 根据掩码筛选正样本 / 保留目标
+        # 筛选
+        cls_, indices = torch.max(cls_result, dim=1)
+        resindx = cls_ > self.threshold
         dfl_res = dfl_result[resindx]
-        grids_res = all_grids[resindx]        # 这里依旧假定 B=1 的场景与原始实现一致
+        grids_res = all_grids[resindx]
         strides_res = all_strides[resindx]
         cls_res = indices[resindx]
         score_res = cls_[resindx]
-
-        # 记录 anchor 索引（只相对于全部 anchors 的平面下标）
-        anchor_idx_all = torch.arange(all_results.shape[0], device=all_results.device)
-        anchor_idx_res = anchor_idx_all[resindx]
-
-        # 解码 bbox
+        if self.return_indices:
+            anchor_idx_all = torch.arange(all_results.shape[0], device=all_results.device)
+            anchor_idx_res = anchor_idx_all[resindx]
+        # 解码 bbox (此时 bbox 是在 640x640 尺度下的)
         bbox_res = self._decode_dfl(dfl_res, grids_res, strides_res)
-
-        # 反 letterbox 到原图
-        if self.padding and (original_img_size is not None) and (bbox_res.numel() > 0):
+        # 坐标还原
+        if (original_img_size is not None) and (bbox_res.numel() > 0):
             input_w, input_h = self.img_size
             orig_w, orig_h = original_img_size
-
-            scale = min(input_w / orig_w, input_h / orig_h)
-            new_w = int(orig_w * scale)
-            new_h = int(orig_h * scale)
-            pad_left = (input_w - new_w) // 2
-            pad_top = (input_h - new_h) // 2
-
-            bbox_res[:, [0, 2]] -= pad_left
-            bbox_res[:, [1, 3]] -= pad_top
-            bbox_res[:, [0, 2]] /= scale
-            bbox_res[:, [1, 3]] /= scale
+            if self.padding:
+                # === 模式 A: Letterbox (保持长宽比 + 填充) ===
+                scale = min(input_w / orig_w, input_h / orig_h)
+                new_w = int(orig_w * scale)
+                new_h = int(orig_h * scale)
+                pad_left = (input_w - new_w) // 2
+                pad_top = (input_h - new_h) // 2
+                bbox_res[:, [0, 2]] -= pad_left
+                bbox_res[:, [1, 3]] -= pad_top
+                bbox_res[:, [0, 2]] /= scale
+                bbox_res[:, [1, 3]] /= scale
+            else:
+                # === 模式 B: Direct Resize (直接拉伸，无填充) ===
+                # <--- 这是你需要的部分
+                scale_x = input_w / orig_w
+                scale_y = input_h / orig_h
+                
+                bbox_res[:, [0, 2]] /= scale_x
+                bbox_res[:, [1, 3]] /= scale_y
+            # 限制坐标在原图范围内
             bbox_res[:, [0, 2]] = torch.clamp(bbox_res[:, [0, 2]], 0, orig_w)
             bbox_res[:, [1, 3]] = torch.clamp(bbox_res[:, [1, 3]], 0, orig_h)
-
-        # 默认保持旧行为：只返回 cls/score/bbox
         if self.return_indices:
             return cls_res, score_res, bbox_res, anchor_idx_res
         else:
             return cls_res, score_res, bbox_res
 
-    def _decode_dfl(self, dfl_logits, grid, strides):
-        assert dfl_logits.shape[1] == 4 * self.reg_max, \
-            f"Expected {4 * self.reg_max} dfl channels, got {dfl_logits.shape[1]}"
-        assert grid.shape[1] == 2, "Grid must be (N, 2)"
-        assert strides.shape[0] == dfl_logits.shape[0], \
-            "Strides must have same length as dfl_logits"
-        N = dfl_logits.shape[0]
+    def _make_grid(self, w, h):
+        # 简单的 grid 生成函数
+        y, x = torch.meshgrid([torch.arange(h), torch.arange(w)], indexing='ij')
+        return torch.stack((x, y), 2).view(-1, 2).float()
 
-        dfl_reshaped = dfl_logits.view(N, 4, self.reg_max)  # (N,4,reg_max)
+    def _decode_dfl(self, dfl_logits, grid, strides):
+        N = dfl_logits.shape[0]
+        dfl_reshaped = dfl_logits.view(N, 4, self.reg_max)
         dfl_probs = dfl_reshaped.softmax(dim=-1)
         discrete_values = torch.arange(
-            self.reg_max, dtype=dfl_logits.dtype, device=dfl_logits.device
-        )
-        offsets = (dfl_probs * discrete_values).sum(dim=-1)  # (N,4)
-
+            self.reg_max, dtype=dfl_logits.dtype, device=dfl_logits.device)
+        offsets = (dfl_probs * discrete_values).sum(dim=-1)
         strides_expanded = strides.unsqueeze(-1).expand_as(offsets)
         offsets_scaled = offsets * strides_expanded
-        l, t, r, b = (
-            offsets_scaled[:, 0],
-            offsets_scaled[:, 1],
-            offsets_scaled[:, 2],
-            offsets_scaled[:, 3],
-        )
-        cx = grid[:, 0] * strides
-        cy = grid[:, 1] * strides
-
+        l, t, r, b = offsets_scaled[:, 0], offsets_scaled[:, 1], offsets_scaled[:, 2], offsets_scaled[:, 3]
+        cx = (grid[:, 0] + 0.5) * strides # 注意：通常 YOLOv8/v10 这里会有 +0.5 的中心点偏移，视具体训练代码而定
+        cy = (grid[:, 1] + 0.5) * strides
         x1 = cx - l
         y1 = cy - t
         x2 = cx + r

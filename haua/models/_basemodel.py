@@ -117,15 +117,16 @@ class BaseModel(nn.Module, FreezeMixin):
         """Head前向传播"""
         return self.head(feats)
 
-    def forward(self, x: torch.Tensor, *args, **kwargs) -> Any:
-        """完整前向传播"""
-        feats = self.forward_backbone(x)
-        fused = self.forward_neck(feats)
-        out = self.forward_head(fused)
+    def forward(self,
+        x: torch.Tensor, 
+        backbone_kwargs: Dict[str, Any] = {},
+        neck_kwargs: Dict[str, Any] = {},
+        head_kwargs: Dict[str, Any] = {}) -> Any:
+        """模型前向传播"""
+        feats = self.backbone(x, **backbone_kwargs)
+        fused = self.neck(feats, **neck_kwargs)
+        out = self.head(fused, **head_kwargs)
         
-        if self.custom_postprocess is not None:
-            out = self.custom_postprocess(out)
-
         return feats, fused, out
     
     def freeze_by_preset(self, preset_name: str):
@@ -176,8 +177,7 @@ class BaseModel(nn.Module, FreezeMixin):
         """便捷方法：解冻Head"""
         return self.unfreeze_parameters(['head'])
     
-    def get_standard_parameter_groups(
-        self,
+    def get_standard_parameter_groups(self,
         lr_backbone: float = 1e-5,
         lr_neck: float = 1e-4,
         lr_head: float = 1e-3,

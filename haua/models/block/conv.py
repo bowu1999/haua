@@ -8,6 +8,29 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+__all__ = [
+    # --------- aux functions ---------
+    'auto_padding', 'get_activation', 'fuse_conv_bn',
+    # --------- blocks ---------
+    'ConvBNAct', # Conv -> BN -> Act 模块，提供 fuse() 将 BN 融合进 Conv
+    'ChannelLayerNorm', # 对 (B, C, H, W) 的特征在 channels 维度上做 LayerNorm（ConvNeXt 风格）
+    'Bottleneck', # Bottleneck
+    'RepVggBlock', # RepVGG 风格的块
+    'CSPRepBlock', # CSP 模块中的扩展路径
+    'UniversalStem', # 通用 Stem 实现，支持多种风格
+    'C2f',
+    'C3',
+    'C3k',
+    'C3k2',
+    'SPP',
+    'SPPF',
+    'Attention',
+    'PSABlock',
+    'C2PSA',
+    'UpsampleModule', # 上采样
+]
+
+
 def auto_padding(
     kernel_size: Union[int, List[int], Tuple[int, ...]],
     padding: Optional[Union[int, List[int], Tuple[int, ...]]] = None,
@@ -24,7 +47,14 @@ def auto_padding(
     return padding # type: ignore
 
 
-def _get_act(act: Optional[Union[str, bool, nn.Module]] = "silu") -> Callable[[], nn.Module]:
+def convert_kernel_size(a):
+    """转换卷积核参数格式"""
+    return ((a, a), (a, a)) if isinstance(a, int) else \
+           a if isinstance(a[0], tuple) else \
+           tuple((x, x) for x in a)
+
+
+def get_activation(act: Optional[Union[str, bool, nn.Module]] = "silu") -> Callable[[], nn.Module]:
     if act is None or act is False:
         return lambda: nn.Identity()
     if isinstance(act, nn.Module):
@@ -38,6 +68,8 @@ def _get_act(act: Optional[Union[str, bool, nn.Module]] = "silu") -> Callable[[]
         return lambda: nn.GELU()
     if name == "leakyrelu":
         return lambda: nn.LeakyReLU(negative_slope=0.1, inplace=True)
+    if name == 'hardsigmoid':
+        return lambda: nn.Hardsigmoid()
     raise ValueError(f"Unsupported act: {act}")
 
 
@@ -74,8 +106,8 @@ def fuse_conv_bn(conv: nn.Conv2d, bn: nn.BatchNorm2d) -> nn.Conv2d:
 
 class ConvBNAct(nn.Module):
     """
-    Conv -> BN -> Act 模块，提供 fuse() 将 BN 融合进 Conv。
-    所有构造参数在 nn 模块创建时使用命名参数。
+    Conv -> BN -> Act 模块，提供 fuse() 将 BN 融合进 Conv
+    所有构造参数在 nn 模块创建时使用命名参数
     """
     def __init__(
         self,
@@ -86,20 +118,21 @@ class ConvBNAct(nn.Module):
         padding: Optional[Union[int, Tuple[int, int]]] = None,
         groups: int = 1,
         dilation: int = 1,
-        act: Union[bool, str, nn.Module] = "silu",
+        act: Optional[Union[bool, str, nn.Module]] = None,
+        bias: bool = False
     ) -> None:
         super().__init__()
         self.conv = nn.Conv2d(
-            in_channels=in_channels,
-            out_channels=out_channels,
-            kernel_size=kernel_size,
-            stride=stride,
-            padding=auto_padding(kernel_size, padding, dilation), # type: ignore
-            dilation=dilation,
-            groups=groups,
-            bias=False)
+            in_channels = in_channels,
+            out_channels = out_channels,
+            kernel_size = kernel_size,
+            stride = stride,
+            padding = auto_padding(kernel_size, padding, dilation), # type: ignore
+            dilation = dilation,
+            groups = groups,
+            bias = bias)
         self.bn = nn.BatchNorm2d(num_features=out_channels, eps=1e-3, momentum=0.03)
-        act_ctor = _get_act(act)
+        act_ctor = get_activation(act)
         self.act = act_ctor()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -139,6 +172,184 @@ class ChannelLayerNorm(nn.Module):
         x_norm = self.norm(x_perm)
 
         return x_norm.permute(0, 3, 1, 2)
+
+
+class Bottleneck(nn.Module):
+    """
+    标准 bottleneck 模块
+    示意图：../assets/block_illustration/bottleneck.png
+    """
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        shortcut: bool = True,
+        groups: int = 1,
+        kernel_sizes: Tuple = (3, 3),
+        expansion: float = 0.5
+    ):
+        """
+        Args:
+            in_channels (int):输入通道数
+            out_channels (int):输出通道数
+            stride (int):步长
+            groups (int):分组
+            kernel_sizes（Tuple）：两个卷积的卷积核大小
+            expansion（float）：膨胀比例
+        """
+        super().__init__()
+        _hidden_channels = int(out_channels * expansion)
+        self.cba1 = ConvBNAct(
+            in_channels = in_channels,
+            out_channels = _hidden_channels,
+            kernel_size = kernel_sizes[0],
+            groups = groups)
+        self.cba2 = ConvBNAct(
+            in_channels = _hidden_channels,
+            out_channels = out_channels,
+            kernel_size = kernel_sizes[1],
+            groups = groups)
+        self.add = shortcut and in_channels == out_channels
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.cba2(self.cba1(x)) if self.add else self.cba2(self.cba1(x))
+
+
+class RepVggBlock(nn.Module):
+    """
+    RepVGG-style block:
+    Training:
+        3x3 ConvBN + 1x1 ConvBN
+    Deploy:
+        single 3x3 Conv (bias=True)
+    """
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        stride: int = 1,
+        act: Union[str, nn.Module, None] = "relu",
+    ):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.stride = stride
+
+        # -------- training branches --------
+        self.cba3 = ConvBNAct(
+            in_channels = in_channels,
+            out_channels = out_channels,
+            kernel_size = 3,
+            stride = stride,
+            padding = 1,
+            act = None,
+            bias = False)
+        self.cba1 = ConvBNAct(
+            in_channels = in_channels,
+            out_channels = out_channels,
+            kernel_size = 1,
+            stride = stride,
+            padding = 0,
+            act = None,
+            bias = False)
+
+        if act is None:
+            self.act = nn.Identity()
+        elif isinstance(act, nn.Module):
+            self.act = act
+        else:
+            self.act = get_activation(act)()
+
+        self.deploy = False
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.deploy:
+            return self.act(self.conv(x))
+        else:
+            return self.act(self.cba3(x) + self.cba1(x))
+
+    def convert_to_deploy(self):
+        """
+        Convert RepVGG block to single Conv2d for inference
+        """
+        if self.deploy:
+            return
+
+        # fuse ConvBNAct branches
+        self.cba3.fuse()
+        self.cba1.fuse()
+
+        # get equivalent kernel & bias
+        kernel3, bias3 = self._get_conv_param(self.cba3.conv)
+        kernel1, bias1 = self._get_conv_param(self.cba1.conv)
+
+        kernel1 = self._pad_1x1_to_3x3(kernel1)
+
+        kernel = kernel3 + kernel1
+        bias = bias3 + bias1
+
+        # create deploy conv
+        self.conv = nn.Conv2d(
+            in_channels = self.in_channels,
+            out_channels = self.out_channels,
+            kernel_size = 3,
+            stride = self.stride,
+            padding = 1,
+            bias = True)
+        self.conv.weight.data.copy_(kernel)
+        self.conv.bias.data.copy_(bias) # type: ignore
+
+        # remove training branches
+        del self.cba3
+        del self.cba1
+
+        self.deploy = True
+
+    @staticmethod
+    def _get_conv_param(conv: nn.Conv2d):
+        weight = conv.weight
+        if conv.bias is None:
+            bias = torch.zeros(weight.size(0), device=weight.device)
+        else:
+            bias = conv.bias
+
+        return weight, bias
+
+    @staticmethod
+    def _pad_1x1_to_3x3(kernel1x1: torch.Tensor) -> torch.Tensor:
+        if kernel1x1 is None:
+            return 0
+
+        return F.pad(kernel1x1, [1, 1, 1, 1])
+
+
+class CSPRepBlock(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        num_blocks: int = 3,
+        expansion: float = 1.0,
+        bias: bool = False,
+        act: str = "silu"
+    ):
+        super(CSPRepBlock, self).__init__()
+        hidden_channels = int(out_channels * expansion)
+        self.cba1 = ConvBNAct(in_channels, hidden_channels, 1, 1, bias=bias, act=act)
+        self.cba2 = ConvBNAct(in_channels, hidden_channels, 1, 1, bias=bias, act=act)
+        self.bottlenecks = nn.Sequential(*[
+            RepVggBlock(hidden_channels, hidden_channels, act=act) for _ in range(num_blocks)])
+        if hidden_channels != out_channels:
+            self.cba3 = ConvBNAct(hidden_channels, out_channels, 1, 1, bias=bias, act=act)
+        else:
+            self.cba3 = nn.Identity()
+
+    def forward(self, x):
+        x_1 = self.cba1(x)
+        x_1 = self.bottlenecks(x_1)
+        x_2 = self.cba2(x)
+
+        return self.cba3(x_1 + x_2)
 
 
 class UniversalStem(nn.Module):
@@ -190,7 +401,7 @@ class UniversalStem(nn.Module):
                     padding = 3,
                     bias = False),
                 self.norm_layer(self.out_channels),
-                _get_act(self.act)(),
+                get_activation(self.act)(),
                 nn.MaxPool2d(kernel_size=3, stride=2, padding=1) if last_pool else nn.Identity())
         elif self.stem_type == "deep":
             # 多个 3x3 conv，首层 stride=2
@@ -225,7 +436,7 @@ class UniversalStem(nn.Module):
                     padding = 0,
                     bias = False),
                 ChannelLayerNorm(num_channels=self.out_channels),
-                _get_act(self.act)())
+                get_activation(self.act)())
         elif self.stem_type == "efficient":
             # EfficientNet 风格：3x3 stride2 -> BN -> Act（主干使用 MBConv/Fused）
             self.block = nn.Sequential(
@@ -275,7 +486,7 @@ class UniversalStem(nn.Module):
                         groups = 1,
                         bias = False),
                     self.norm_layer(self.out_channels // 2),
-                    _get_act(self.act)())
+                    get_activation(self.act)())
             # 统一 fuse -> reduce to out_channels
             fuse_reducer = ConvBNAct(
                 in_channels = (self.out_channels // 2) * (1 + len(large_paths)),
@@ -340,7 +551,7 @@ class UniversalStem(nn.Module):
             self.patch_conv = nn.Conv2d(in_channels=self.in_channels,
             out_channels=self.out_channels, kernel_size=4, stride=4, padding=0, bias=False)
             self.patch_norm = ChannelLayerNorm(num_channels=self.out_channels)
-            self.patch_act = _get_act(self.act)()
+            self.patch_act = get_activation(self.act)()
         elif self.stem_type == "yolo":
             # YOLO 风格轻量 stem：两个 3x3 conv，首层 stride=2
             self.block = nn.Sequential(
@@ -436,46 +647,6 @@ class UniversalStem(nn.Module):
 
         return self
 
-class Bottleneck(nn.Module):
-    """
-    标准 bottleneck 模块
-    示意图：../assets/block_illustration/bottleneck.png
-    """
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        shortcut: bool = True,
-        groups: int = 1,
-        kernel_sizes: Tuple = (3, 3),
-        expansion: float = 0.5
-    ):
-        """
-        Args:
-            in_channels (int):输入通道数
-            out_channels (int):输出通道数
-            stride (int):步长
-            groups (int):分组
-            kernel_sizes（Tuple）：两个卷积的卷积核大小
-            expansion（float）：膨胀比例
-        """
-        super().__init__()
-        _hidden_channels = int(out_channels * expansion)
-        self.cba1 = ConvBNAct(
-            in_channels = in_channels,
-            out_channels = _hidden_channels,
-            kernel_size = kernel_sizes[0],
-            groups = groups)
-        self.cba2 = ConvBNAct(
-            in_channels = _hidden_channels,
-            out_channels = out_channels,
-            kernel_size = kernel_sizes[1],
-            groups = groups)
-        self.add = shortcut and in_channels == out_channels
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.cba2(self.cba1(x)) if self.add else self.cba2(self.cba1(x))
-
 
 class C2f(nn.Module):
     """
@@ -532,14 +703,14 @@ class C3(nn.Module):
     示意图：../assets/block_illustration/C3.png
     """
     def __init__(
-            self,
-            in_channels: int,
-            out_channels: int,
-            num_blocks: int = 1,
-            expansion: float = .5,
-            groups: int = 1,
-            shortcut: bool = False
-        ):
+        self,
+        in_channels: int,
+        out_channels: int,
+        num_blocks: int = 1,
+        expansion: float = .5,
+        groups: int = 1,
+        shortcut: bool = False
+    ):
         """
         Args:
             in_channels (int): 输入通道数
@@ -570,13 +741,6 @@ class C3(nn.Module):
         x2 = self.right_cba(x)
 
         return self.back_cba(torch.cat((x1, x2), 1))
-
-
-def convert_kernel_size(a):
-    """转换卷积核参数格式"""
-    return ((a, a), (a, a)) if isinstance(a, int) else \
-           a if isinstance(a[0], tuple) else \
-           tuple((x, x) for x in a)
 
 
 class C3k(C3):
@@ -661,7 +825,7 @@ class C3k2(C2f):
 
 
 class SPP(nn.Module):
-    """Spatial Pyramid Pooling (SPP) layer https://arxiv.org/abs/1406.4729."""
+    """"""
 
     def __init__(self, c1: int, c2: int, k: tuple[int, ...] = (5, 9, 13)):
         """Initialize the SPP layer with input/output channels and pooling kernel sizes.
