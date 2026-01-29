@@ -1,1 +1,2 @@
 from .yolo_segmenter import PrototypeSegmenter, YOLOSegmenter
+from .rtdetrv2 import DETRTransformerDecoderWithMask, RTDETRInstanceSegmenter

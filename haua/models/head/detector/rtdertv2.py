@@ -93,18 +93,23 @@ def getContrastiveDenoisingTrainingGroup(
     # reconstruct cannot see each other
     for i in range(num_group):
         if i == 0:
-            attn_mask[max_gt_num * 2 * i: max_gt_num * 2 * (i + 1), max_gt_num * 2 * (i + 1): num_denoising] = True
+            attn_mask[
+                max_gt_num * 2 * i: max_gt_num * 2 * (i + 1),
+                max_gt_num * 2 * (i + 1): num_denoising] = True
         if i == num_group - 1:
-            attn_mask[max_gt_num * 2 * i: max_gt_num * 2 * (i + 1), :max_gt_num * i * 2] = True
+            attn_mask[
+                max_gt_num * 2 * i: max_gt_num * 2 * (i + 1),
+                : max_gt_num * i * 2] = True
         else:
-            attn_mask[max_gt_num * 2 * i: max_gt_num * 2 * (i + 1), max_gt_num * 2 * (i + 1): num_denoising] = True
+            attn_mask[
+                max_gt_num * 2 * i: max_gt_num * 2 * (i + 1),
+                max_gt_num * 2 * (i + 1): num_denoising] = True
             attn_mask[max_gt_num * 2 * i: max_gt_num * 2 * (i + 1), :max_gt_num * 2 * i] = True
         
     dn_meta = {
         "dn_positive_idx": dn_positive_idx,
         "dn_num_group": num_group,
-        "dn_num_split": [num_denoising, num_queries]
-    }
+        "dn_num_split": [num_denoising, num_queries]}
 
     # print(input_query_class.shape) # torch.Size([4, 196, 256])
     # print(input_query_bbox.shape) # torch.Size([4, 196, 4])
@@ -176,7 +181,8 @@ class RTDETRTransformerv2(nn.Module):
         self.label_noise_ratio = label_noise_ratio
         self.box_noise_scale = box_noise_scale
         if num_denoising > 0: 
-            self.denoising_class_embed = nn.Embedding(num_classes+1, hidden_dim, padding_idx=num_classes)
+            self.denoising_class_embed = nn.Embedding(
+                num_classes+1, hidden_dim, padding_idx=num_classes)
             init.normal_(self.denoising_class_embed.weight[:-1])
 
         # decoder embedding
@@ -366,7 +372,7 @@ class RTDETRTransformerv2(nn.Module):
         if denoising_bbox_unact is not None:
             enc_topk_bbox_unact = torch.concat([denoising_bbox_unact, enc_topk_bbox_unact], dim=1)
             content = torch.concat([denoising_logits, content], dim=1) # type: ignore
-        # (B, D+K, C), (B, D+k, 4), n*(B, D+k, 4), n*(B,K,N_cls)
+        # (B, D+K, C), (B, D+K, 4), 1*(B, K, 4), 1*(B,K,N_cls)
         return content, enc_topk_bbox_unact, enc_topk_bboxes_list, enc_topk_logits_list
 
     def _select_topk(self,
@@ -411,9 +417,9 @@ class RTDETRTransformerv2(nn.Module):
                     self.num_classes, 
                     self.num_queries, 
                     self.denoising_class_embed,
-                    num_denoising=self.num_denoising, 
-                    label_noise_ratio=self.label_noise_ratio, 
-                    box_noise_scale=self.box_noise_scale, )
+                    num_denoising = self.num_denoising, 
+                    label_noise_ratio = self.label_noise_ratio, 
+                    box_noise_scale = self.box_noise_scale, )
         else:
             denoising_logits, denoising_bbox_unact, attn_mask, dn_meta = None, None, None, None
 
@@ -429,7 +435,7 @@ class RTDETRTransformerv2(nn.Module):
             self.dec_bbox_head,
             self.dec_score_head,
             self.query_pos_head,
-            attn_mask=attn_mask)
+            attn_mask = attn_mask)
 
         if self.training and dn_meta is not None:
             dn_out_bboxes, out_bboxes = torch.split(out_bboxes, dn_meta['dn_num_split'], dim=2)
